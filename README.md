@@ -1,0 +1,68 @@
+# Build Ahead (Project Zomboid B42)
+
+Place constructions while you are still building, or before you have the materials. Every click with the build cursor becomes a planned site, drawn as a ghost, and a scheduler does the building: if you are idle, you walk to the nearest buildable site right away; otherwise the sites wait, and each time a build finishes the nearest buildable site within 20 tiles is built next. Right-click a ghost to cancel it.
+
+## Install
+
+- Steam Workshop: subscribe and enable "Build Ahead" in the mod list. (The link will be added after the first upload.)
+- Manual: copy `Contents/mods/BuildAhead` into `%USERPROFILE%\Zomboid\mods\`.
+- Multiplayer: install it on the server and on every client.
+
+## Compatibility
+
+Project Zomboid Build 42. Works with the build window's buildings (B42 build entities, `ISBuildIsoEntity`). Wraps vanilla functions without replacing vanilla files. Safe to add to existing saves; removing it drops the planned sites. Mods that also change build placement or the action queue may conflict.
+
+## Features
+
+
+- Ghost colors: blue = can be built now (the materials are at hand or can be fetched), yellow = the materials are missing (not at hand and not found within 20 tiles of the site), red = the square is blocked, orange = building it would wall you in (see below).
+- Never walled in by the chain: before the scheduler starts a site on its own (after a click, after a build, and after fetching), the result is simulated. The edges and squares the object will block (wall edges and solid squares, from its tiles' properties) are added to the walls already there, and the walkable squares on your level are searched from each square you could build it from. A square would trap you when its area is closed after the build (no stairs, door, window, window frame or low fence reached, and not 30 tiles away) and was open before. Tall fences and walls you could climb (e.g. a log wall) do not count as a way out; a wall frame can be climbed through, so it never traps. A wall is built from one side of its edge, so the same wall can trap from inside and not from outside: you then walk to the nearest square that does not trap you, the outer side of the wall when there is one, and build from there. A site that would trap you from every square is not built automatically: it stays planned, the chain builds the other sites, its ghost is orange, and a click names the reason ("Building this would wall you in"). Ordering it by hand is allowed: "Build planned" stays on, with "(may trap you)" added to its label, and builds it (from a safe side if there is one, else from where you are, walling you in). The chain after it avoids traps again. The check runs once when a site is picked or started, and for the ghost colour at most every 2 seconds per site; it is client-side only. Ghost colours are rechecked for at most 8 sites per frame, and the material search for at most 2 sites per frame from a scan shared by sites near each other, so dozens of planned sites stay cheap.
+- Fetching materials: materials at hand are vanilla's (inventory, the loot window's containers, the floor in the 3x3 around you). What a site still lacks is searched within 20 tiles of the site, on its level: items on the floor, containers, corpses, and vehicle trunks and truck beds (not seats or glove boxes; a closed, unlocked trunk lid is opened). Locked containers, other players' safehouses, banned item types and anything that cannot be reached are left out. You walk to the nearest source, take what is needed, go on to the next source while your weight allows, and walk to the site. If everything fit in your bag, the build starts right away and takes the materials from your inventory. If your carry weight cut the trip short, you drop the load on the square you will build from (spread over the 3x3 when a square is full) and go back for the rest; the last trip again builds straight from the inventory. A source that fails during the chain (path fails, items gone, transfer refused) is left out for 5 minutes. Moving or starting another action stops the fetch where it is.
+- Tools: a tool taken from a container (or the floor) stays in your inventory while the chain runs and goes back where it came from when the chain ends; tools you had stay with you. The weapon you held before the chain started is equipped again.
+- When a build starts, the materials are taken from what is at hand where you stand then (the containers are refreshed at that moment), so materials left near where you clicked are no longer used from a distance.
+- Clicking where the materials are missing still plans the site, and a note over the character names what is missing. The Build button in the build panel is always on.
+- Building starts only on a click, when a build finishes, or from "Build planned". Materials appearing while idle do not start anything: right-click a ghost and choose "Build planned" to start building from that site. The option is greyed out with the reason when the site cannot be built (blocked, skill too low, or materials neither at hand nor within 20 tiles; a site that would wall you in stays available, with a warning).
+- The scheduler picks the materials itself; inputs chosen by hand in the build panel are not used, and every click goes through the planned sites.
+- Material bans: in the build window, each material box has a small "X" button at its top left, and the item list for selecting inputs has an "X" box at the right of each item type. It bans that item type (in a material box, the type the box shows at that moment, since its icon cycles through the alternatives) ("Base.Plank") for all planned builds: the scheduler then uses other allowed items, and if every alternative for a material is banned the site shows as "materials missing" (yellow). A banned type is drawn dimmed and red; click "X" again to allow it. The ban list has no window of its own. It is per player, kept in the player's ModData (in multiplayer each player has their own: the server keeps a copy with the player and applies the bans itself when it performs the build, since it does not receive the client's choice of inputs), and bans item types only, not containers or places.
+- A planned site needs no materials. If a site cannot be built (materials missing, square blocked, fetching failed, or the walk to it failed because no square it can be built from can be reached), the chain skips it and the site stays planned.
+- Upgrades can be planned ahead too: a wall or window frame on a planned wall frame, a door in a planned door frame. The cursor accepts the square, the new ghost stays red until the stage below is built, and the chain then builds it. After a scheduler build the build panel's material counts are refreshed.
+- Sites are saved with the world (global ModData). In multiplayer the server keeps the list and shares it with every player. Any player's chain builds any nearby site, and a site that someone is building is marked so that other players' chains leave it alone; the mark is released as soon as that player stops (moves, starts another action, or the chain gives the site up). The mod must be on the server and on every client.
+
+## Test (development)
+
+The test save (`tests/save`) and the test data folders are not in the repository; set `SAVE` in `pzt.conf` to a save of your own.
+
+Single-player, with [PZTestHarness](../PZTestHarness) (`pzt`; needs ZombieBuddy in `~/Zomboid/mods` and in the game folder, see its README):
+
+```bash
+pzt run
+```
+
+(or `bash tools/test.sh`, which runs `pzt run MEM_WAIT=600` and then the reload run below; without `pzt` on the PATH: `bash ../PZTestHarness/pzt run`.) Settings are in `pzt.conf`. pzt builds an isolated data folder `pzt-env/Zomboid` (`-cachedir`), copies a fresh `tests/save` and the mod into it, installs `tests/BuildAhead_Test.lua` and `tests/BuildAhead_Test2.lua` into the test copy of the mod only (`TEST_FILES`), launches the game with `-nosteam`, continues the save, runs both tests and quits; the game saves the world on quit. `tools/test.sh` then continues that saved world (`pzt run KEEP_SAVE=1` with the steps `BuildAheadTest2.reloadStart()` / `poll()`) and checks what was kept. It prints the `[PZTest]` / `[BuildAhead(Test)]` lines and exits 1 when a check failed or the test did not finish; every failed check is also a `[PZTest] FAIL` line, and an error in a phase ends the test right away. Full log: `pzt-env/Zomboid/console.txt`; screenshots: `pzt-env/Zomboid/Screenshots/pzt_<run>_buildahead_stage1.png` (ghosts) and `_stage2.png` (fetching). `tools/test.sh` takes about 12 minutes (main run about 9, reload run about 2).
+
+What the single-player tests cover:
+
+- `BuildAhead_Test.lua` (part 1): planning by click while idle and while building, the chain (nearest first, a site without materials left planned), ghost states and the screenshot, the right-click menu (cancel, "Build planned", greyed out with the reason), the Build button, material bans (both toggles, ModData, all alternatives banned), skill checks, fetching from crates and the floor (locked crate, walled-in square, vanishing source and banned items left alone, tool returned, weapon re-equipped), multi-trip fetching with a drop only on the trips cut short, and self-enclosure (built from outside, skipped from inside, "Build planned" with the warning, an open wall line). Part 1 runs with the debug build cheat on (no walks to the builds).
+- `BuildAhead_Test2.lua` (part 2, scenarios in their own free areas; vanilla's walks to the builds are on, as in a normal game):
+  - build types: wall frame + wall and wall frame + window frame (previous stages), door frame + door, a two-tile table, stairs; the upgrades are planned through the cursor on the planned frame, stay red until it exists and are built after it; vanilla walks to the bottom end of the stairs; objects on every tile, materials consumed, sites removed; the player's build cursor is kept when the scheduler starts a build.
+  - upper floors: on created level-1 floors, a floor next to the strip and then a wall frame on it are built; a floor whose only square to build from is an unreachable floor island is tried, its path fails, it stays planned and unclaimed and the chain goes on; the character never stands on a square without a floor and stays on level 1.
+  - material sources: a closed, unlocked car trunk (the lid is opened) and a corpse; a locked trunk nearer is left alone.
+  - interruption: moving while walking to a source, another action while carrying the materials to the site, moving while walking to a build: the chain stops, nothing restarts on its own, the site stays planned and unclaimed, carried materials and the borrowed hammer stay in the bag; "Build planned" or a later click resumes, and the hammer goes back to its crate when that chain ends. A movement key is simulated (`BuildAhead.tookOver`, the walk stopped as the game does), as is another action (the queue cleared and a walk added).
+  - many sites: 64 planned sites; frame time with all of them yellow (materials searched for) and blue, against no sites (bounds: average within 5 ms, no frame over 100 ms or twice the longest frame without sites; the first evaluation of 64 sites planned in the same frame under 500 ms); the chain still builds nearest first.
+  - persistence: three sites (one an upgrade on a planned frame) and a ban are left; the reload run checks that the sites (name, square, rotation) and the ban came back, that the ghosts are drawn and that nothing starts on load.
+
+Not automated: real mouse clicks and the feel of the cursor, a zombie attack interrupting an action (the interruption tests cover a stopped walk or build, which is what a hit does), and a server over Steam with several players.
+
+- `pzt live` keeps the test game open after the run (Lua edits still restart it; Lua is not hot-reloaded), `pzt stop` closes it, `pzt log` shows the last lines.
+- One client needs about 3 GB. Run one test game at a time: `MEM_WAIT=300` (the wrapper uses 600) waits for free memory, e.g. while IsoRotate's test game runs; `HEAP=2048m` lowers the heap.
+- `pzt stop` only kills the game started with BuildAhead's own `pzt-env`.
+
+```bash
+bash tools/mptest.sh
+```
+
+Multiplayer: starts a local dedicated server (`-nosteam`, port 16361, `mpenv/server`) and one client (`mpenv/client`) that connects as admin and runs `tests/BuildAhead_MPTest.lua`: clicks and the chain through the server (server ids, claims by square), removal and cancel on the server, bans applied by the server, fetching from the floor, an interrupted walk to a build (the server releases the claim at once; "Build planned" resumes), and persistence: the client plans two sites and asks the server to save and quit (`/quit`); the script restarts the server and the client, which checks that the server's list kept both sites with their ids. A new client folder is copied from `pzt-env/Zomboid`, so run `tools/test.sh` once first. Results are the `[BuildAheadMP]` lines in `mpenv/client/console_on.txt` and `console_persist.txt` and the `[BuildAhead] server` lines in `mpenv/server.log` and `server2.log`; the script prints the totals and exits 1 on a failed check. It takes about 8 minutes. The server's sandbox is set to no zombies (their hits interrupt the walks and builds under test); on the very first run the server writes that file itself, so a second run is the one without zombies.
+
+## Support
+
+If this mod helps you, you can support it via [PayPal](https://www.paypal.com/paypalme/TalkingHands619/3). It's optional; every feature stays free.

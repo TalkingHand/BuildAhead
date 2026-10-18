@@ -1,0 +1,14 @@
+{
+    "IGUI_BuildAhead_FetchFailed": "Could not fetch the materials",
+    "IGUI_BuildAhead_CancelSite": "Cancel planned build: %1",
+    "IGUI_BuildAhead_CancelNear": "Cancel all planned builds nearby",
+    "IGUI_BuildAhead_BuildSite": "Build planned: %1",
+    "IGUI_BuildAhead_CannotBuild": "Cannot build this yet",
+    "IGUI_BuildAhead_Missing": "Missing, not found within %2 tiles: %1",
+    "IGUI_BuildAhead_Ban": "Do not use for planned builds: %1",
+    "IGUI_BuildAhead_Unban": "Use again for planned builds: %1",
+    "IGUI_BuildAhead_NeedSkill": "Needs %1",
+    "IGUI_BuildAhead_Blocked": "Cannot build here",
+    "IGUI_BuildAhead_Trap": "Building this would wall you in",
+    "IGUI_BuildAhead_MayTrap": "(may trap you)"
+}

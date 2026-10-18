@@ -1,0 +1,8 @@
+name=Build Ahead
+id=BuildAhead
+description=Every build-cursor click becomes a planned site (ghost) that your character builds next, nearest first. Plan while building or without materials; missing materials are fetched from within 20 tiles. Multiplayer: the mod is needed on the server and every client.
+poster=poster.png
+author=TalkingHand
+url=https://github.com/TalkingHand/BuildAhead
+modversion=1.0.0
+versionMin=42.0

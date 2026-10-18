@@ -1,0 +1,14 @@
+{
+    "IGUI_BuildAhead_FetchFailed": "재료를 가져오지 못함",
+    "IGUI_BuildAhead_CancelSite": "건설 예정 취소: %1",
+    "IGUI_BuildAhead_CancelNear": "근처 건설 예정 모두 취소",
+    "IGUI_BuildAhead_BuildSite": "예정지 건설: %1",
+    "IGUI_BuildAhead_CannotBuild": "아직 지을 수 없음",
+    "IGUI_BuildAhead_Missing": "재료 부족 (%2타일 안에 없음): %1",
+    "IGUI_BuildAhead_Ban": "건설 예정에 사용 안 함: %1",
+    "IGUI_BuildAhead_Unban": "건설 예정에 다시 사용: %1",
+    "IGUI_BuildAhead_NeedSkill": "필요 기술: %1",
+    "IGUI_BuildAhead_Blocked": "이 자리에는 지을 수 없음",
+    "IGUI_BuildAhead_Trap": "지으면 안에 갇히게 됨",
+    "IGUI_BuildAhead_MayTrap": "(갇힐 수 있음)"
+}
