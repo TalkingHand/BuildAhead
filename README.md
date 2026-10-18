@@ -4,7 +4,7 @@ Place constructions while you are still building, or before you have the materia
 
 ## Install
 
-- Steam Workshop: subscribe and enable "Build Ahead" in the mod list. (The link will be added after the first upload.)
+- Subscribe on the [Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3822552929) (ID `3822552929`) and enable "Build Ahead" in the mod list.
 - Manual: copy `Contents/mods/BuildAhead` into `%USERPROFILE%\Zomboid\mods\`.
 - Multiplayer: install it on the server and on every client.
 
