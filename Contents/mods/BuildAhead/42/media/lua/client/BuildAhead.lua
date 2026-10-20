@@ -329,6 +329,19 @@ function BuildAhead.hasMaterialsNow(playerObj, site)
     return hasMaterials(playerObj, site, BuildAhead.freshContainers(playerObj))
 end
 
+-- what the build's own check lacks right now, for the log: "Plank x2", the
+-- inputs it filled, and the number of containers at hand
+function BuildAhead.lackingNow(playerObj, site)
+    local e = siteEntity(playerObj, site)
+    if not e then return "no entity" end
+    local containers = BuildAhead.freshContainers(playerObj)
+    local logic = e.buildPanelLogic
+    logic:setContainers(containers)
+    fillInputs(logic, playerObj, containers)
+    return table.concat(missingMaterials(logic), ", ") .. " | filled " .. BuildAhead.describeInputs(logic)
+        .. " | containers " .. containers:size() .. " | can " .. tostring(logic:canPerformCurrentRecipe())
+end
+
 -- a BuildLogic of the site's recipe for planning, apart from the ghost's entity
 local function planLogic(playerObj, site)
     siteEntity(playerObj, site)
@@ -346,16 +359,19 @@ end
 -- the missing names when the sources within range are not enough.
 -- base: the containers whose materials count as there already (default: what
 -- the player carries, since loot-window containers stay behind when the player
--- walks to the site); exclude: a square whose 3x3 is not searched (at hand);
--- reuse: a scan made a moment ago for a site nearby may answer (BuildAheadFetch.scan).
-function BuildAhead.fetchPlan(playerObj, site, base, exclude, reuse)
+-- walks to the site); atHand: the square the site is built from, whose 3x3 is
+-- at hand there (counted as there already, not fetched; default: the site's kept
+-- stand square); reuse: a scan made a moment ago for a site nearby may answer
+-- (BuildAheadFetch.scan).
+function BuildAhead.fetchPlan(playerObj, site, base, atHand, reuse)
     local logic = planLogic(playerObj, site)
     if not logic then return nil, {} end
     base = base or carriedContainers(playerObj)
+    atHand = atHand or BuildAhead.keptStand(site)
     local bans = BuildAhead.getBans(playerObj)
     logic:setContainers(base)
     BuildAheadInputs.fill(logic, bans, base)
-    return BuildAheadFetch.plan(playerObj, logic, bans, site.x, site.y, site.z, exclude, base, reuse)
+    return BuildAheadFetch.plan(playerObj, logic, bans, site.x, site.y, site.z, atHand, base, reuse)
 end
 
 -- While the ghosts are drawn, at most this many sites per frame get a new
@@ -458,14 +474,104 @@ local function walkToStand(playerObj, stand)
 end
 BuildAhead.walkToStand = walkToStand
 
--- Where the player builds the site from: sets e.buildAheadStand when some
--- squares around it would trap the player (the walk then goes to a safe one).
--- false: every square traps (unless the site was ordered by hand).
+-- The square a site is built from, chosen once and kept for the site: every
+-- fetch trip walks there and drops its load around it, and the build takes the
+-- materials from there. Vanilla's walk to a wall (AdjacentFreeTileFinder.FindWall)
+-- picks the side nearest in a straight line, which outdoors can be across a
+-- wall from the player and can change from one trip to the next.
+local stands = {} -- site key (name and square) -> "x,y" of its stand square
+BuildAhead.STAND_RADIUS = 40 -- path search around the player for the stand, in squares
+BuildAhead.STAND_OFF_EDGE = 1000 -- extra steps for a stand off either side of the new edge (only when no side is reached)
+
+local function standKey(site)
+    return site.name .. "@" .. site.x .. "," .. site.y .. "," .. site.z .. ":" .. tostring(site.nSprite)
+end
+
+-- the stand square kept for the site, if any (no search)
+function BuildAhead.keptStand(site)
+    local s = stands[standKey(site)]
+    if not s then return nil end
+    local x, y = string.match(s, "^(-?%d+),(-?%d+)$")
+    return getCell():getGridSquare(tonumber(x), tonumber(y), site.z)
+end
+
+-- The stand square for the site (kept, or chosen now): among the squares that
+-- do not wall the player in, the one the player reaches in the fewest steps,
+-- preferring the two sides of a new edge. nil: nothing found (vanilla walks).
+-- r: the site's trapCheck result.
+function BuildAhead.standFor(playerObj, site, r)
+    if not r or #r.safe == 0 then return nil end
+    local k = standKey(site)
+    local kept = stands[k]
+    local byKey = {}
+    for _, sq in ipairs(r.safe) do byKey[sq:getX() .. "," .. sq:getY()] = sq end
+    local psq = playerObj:getCurrentSquare()
+    local sameLevel = psq ~= nil and psq:getZ() == site.z
+    if kept and byKey[kept] then
+        local sq = byKey[kept]
+        if not sameLevel or sq == psq then return sq end
+        local d = BuildAheadTrap.pathDistances(psq, { sq }, BuildAhead.STAND_RADIUS)
+        if d[BuildAheadTrap.key(sq:getX(), sq:getY())] then return sq end
+    end
+    stands[k] = nil
+    if not sameLevel then return nil end
+    local dist = BuildAheadTrap.pathDistances(psq, r.safe, BuildAhead.STAND_RADIUS)
+    local best, bestScore
+    for _, sq in ipairs(r.safe) do
+        local sk = BuildAheadTrap.key(sq:getX(), sq:getY())
+        local d = dist[sk]
+        if d then
+            local score = d + (r.preferred[sk] and 0 or BuildAhead.STAND_OFF_EDGE)
+            if not bestScore or score < bestScore then best, bestScore = sq, score end
+        end
+    end
+    if best then
+        stands[k] = best:getX() .. "," .. best:getY()
+        log("site", site.id, "stand", best:getX(), best:getY(), "steps", dist[BuildAheadTrap.key(best:getX(), best:getY())])
+    end
+    return best
+end
+
+-- a wall, door, frame or window: vanilla sets e.isWallLike only while it draws
+-- the cursor, so the scheduler's entities work it out the same way here
+local function isWallLike(e)
+    -- (ISBuildingObject starts it at false, so only true can be trusted)
+    if e.isWallLike then return true end
+    if e.buildAheadWallLike ~= nil then return e.buildAheadWallLike end
+    local ok, yes = pcall(function()
+        local face = e:getFace()
+        for xx = 0, face:getWidth() - 1 do
+            for yy = 0, face:getHeight() - 1 do
+                local ti = face:getTileInfo(xx, yy, 0)
+                local name = ti and ti:getSpriteName()
+                if name then
+                    local props = getSprite(name):getProperties()
+                    for _, t in ipairs({ "WALL_N", "WALL_W", "WALL_N_TRANS", "WALL_W_TRANS", "WINDOW_N", "WINDOW_W",
+                        "DOOR_WALL_N", "DOOR_WALL_W" }) do
+                        if IsoPropertyType[t] and props:has(IsoPropertyType[t]) then return true end
+                    end
+                    -- a door in a frame stands on the frame's edge too
+                    for _, f in ipairs({ "doorN", "doorW", "WallN", "WallW", "WallNTrans", "WallWTrans" }) do
+                        if IsoFlagType[f] and props:has(IsoFlagType[f]) then return true end
+                    end
+                    return false
+                end
+            end
+        end
+        return false
+    end)
+    e.buildAheadWallLike = ok and yes or false
+    if e.buildAheadWallLike then e.isWallLike = true end
+    return e.buildAheadWallLike
+end
+
+-- Where the player builds the site from: sets e.buildAheadStand (the walk then
+-- goes there, see BuildAhead.standFor). false: every square traps (unless the
+-- site was ordered by hand).
 local function chooseStand(playerObj, site, e)
     if playerObj:isBuildCheat() then return true end
     local r = trapCheck(playerObj, site, true)
-    local stand, all = BuildAheadTrap.standSquare(playerObj, r)
-    if all then
+    if r and r.trap and #r.safe == 0 then
         if directSites[site.id] then
             log("site", site.id, "ordered by hand: built although it walls the player in")
             return true
@@ -473,12 +579,31 @@ local function chooseStand(playerObj, site, e)
         log("site", site.id, "would wall the player in from every side:", BuildAheadTrap.squares(r.trapped))
         return false
     end
+    -- walls, doors and frames: a kept stand on the side the player reaches. Other
+    -- objects (stairs, furniture) walk the vanilla way unless a side traps.
+    local stand
+    if isWallLike(e) or (r and r.trap) then
+        -- frames and doors block nothing (they can be passed): stand anywhere around
+        local cands = r
+        if not cands then
+            local ok, res = pcall(BuildAheadTrap.standsAround, e, site.x, site.y, site.z)
+            cands = ok and res or nil
+        end
+        stand = BuildAhead.standFor(playerObj, site, cands)
+    end
+    if not stand and r and r.trap then
+        -- no path found: the safe square nearest in a straight line, as before
+        stand = BuildAheadTrap.standSquare(playerObj, r)
+    end
     if stand then
-        log("site", site.id, "built from", stand:getX(), stand:getY(), "- would trap at", BuildAheadTrap.squares(r.trapped))
+        if r and r.trap then
+            log("site", site.id, "built from", stand:getX(), stand:getY(), "- would trap at", BuildAheadTrap.squares(r.trapped))
+        end
         e.buildAheadStand = stand
     end
     return true
 end
+BuildAhead.chooseStand = chooseStand
 
 local function cursorRecipe(cursor)
     return cursor.objectInfo and cursor.objectInfo:getRecipe() and cursor.objectInfo:getRecipe():getCraftRecipe()
@@ -638,6 +763,9 @@ function BuildAhead.buildSite(playerObj, site)
     if playerObj:isBuildCheat() then return BuildAhead.tryBuildSite(playerObj, site) end
     -- before walking off to fetch: the state pickNext saw may be a moment old
     if not directSites[site.id] and BuildAhead.wouldTrap(playerObj, site, true) then return false end
+    -- the square it is built from: what lies around it is at hand there, not fetched
+    local e = siteEntity(playerObj, site)
+    if e then pcall(chooseStand, playerObj, site, e) end
     local ok, plan = pcall(BuildAhead.fetchPlan, playerObj, site)
     if not ok then log("fetch plan error", plan); plan = nil end
     if plan and #plan == 0 then return BuildAhead.tryBuildSite(playerObj, site) end

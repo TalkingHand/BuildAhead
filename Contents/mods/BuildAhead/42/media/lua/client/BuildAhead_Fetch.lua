@@ -9,11 +9,14 @@
 --
 -- A fetch job, per site: walk to the nearest source and take what is needed
 -- (ISInventoryTransferAction, ISGrabItemAction for floor items), source after
--- source while the weight allows; then walk to the site. When the weight
--- stopped the trip short, drop the load on the square the player stands on
--- (spread over the 3x3 if a square is full) and go again; the last trip keeps
--- its load in the inventory. Once the materials are at hand (carried plus
--- dropped), build (BuildAhead.tryBuildSite).
+-- source while the inventory and the worn bags have room (up to their
+-- capacity: the player may be overloaded for the trip); then walk to the
+-- site's stand square (BuildAhead.standFor: one square per site, kept for all
+-- trips). When the room stopped the trip short, drop the load on the stand
+-- square (spread over its 3x3 if a square is full) and go again; the last trip
+-- keeps its load. What lies in the stand's 3x3 counts as at hand and is never
+-- fetched. Once the materials are at hand (carried plus dropped), build
+-- (BuildAhead.tryBuildSite).
 -- Tools are kept in the inventory: a tool taken from a container (or the floor)
 -- goes back there when the chain ends, and the weapon held before the chain
 -- started is equipped again.
@@ -37,7 +40,7 @@ F.FLOOR_CAP = 50             -- ISDropWorldItemAction refuses more weight per sq
 F.job = nil      -- the running fetch (or tool return) job
 F.chain = nil    -- { player, primary, secondary, borrowed = { { id, src } } }
 F.blacklist = {} -- source key -> time it may be used again
-F.stats = { drops = 0 } -- drop actions queued (tests)
+F.stats = { drops = 0, takes = 0, rehandled = 0 } -- drops queued, items taken, takes from where the site is built from (tests)
 
 local function log(...)
     BuildAhead.log("fetch", ...)
@@ -276,15 +279,58 @@ local function distSq(playerObj, src)
     return (src.x + 0.5 - playerObj:getX()) ^ 2 + (src.y + 0.5 - playerObj:getY()) ^ 2
 end
 
+-- the source lies in the 3x3 of the square the site is built from, reachable
+-- from there: the build takes from it without a trip
+local function atHandOf(src, stand)
+    if not stand or src.kind == "vehicle" or src.z ~= stand.z
+        or math.abs(src.x - stand.x) > 1 or math.abs(src.y - stand.y) > 1 then
+        return false
+    end
+    local sq = stand.sq
+    return sq ~= nil and (sq == src.sq or sq:canReachTo(src.sq))
+end
+
+-- { x, y, z, sq } from an IsoGridSquare or a { x, y, z } table
+local function standOf(s)
+    if not s then return nil end
+    if type(s) == "table" then
+        return { x = s.x, y = s.y, z = s.z, sq = s.sq or getCell():getGridSquare(s.x, s.y, s.z) }
+    end
+    return { x = s:getX(), y = s:getY(), z = s:getZ(), sq = s }
+end
+F.standOf = standOf
+
 -- What to fetch so that `logic` (filled from the materials at hand) can do its
 -- recipe: { { src, items = { { item, wo, tool } } } }, nearest source first;
 -- {} when nothing is short. nil and the names still missing ("Plank x2") when
--- the sources within range are not enough. reuse: see F.scan.
-function F.plan(playerObj, logic, bans, cx, cy, cz, exclude, base, reuse)
+-- the sources within range are not enough. atHand: the square the site is built
+-- from; what lies in its 3x3 counts as there already and is not fetched.
+-- reuse: see F.scan.
+function F.plan(playerObj, logic, bans, cx, cy, cz, atHand, base, reuse)
     local taken = {}
     local shorts = F.shortInputs(logic, base, bans, playerObj, taken)
     if #shorts == 0 then return {} end
-    local sources = F.scan(playerObj, cx, cy, cz, exclude, reuse)
+    local stand = standOf(atHand)
+    local sources = F.scan(playerObj, cx, cy, cz, nil, reuse)
+    -- materials lying where the site is built from: count them first
+    local others = {}
+    for _, src in ipairs(sources) do
+        if atHandOf(src, stand) then
+            for _, s in ipairs(shorts) do
+                for _, e in ipairs(F.sourceItems(src)) do
+                    if s.short <= 0 then break end
+                    local id = e.item:getID()
+                    if not taken[id] and usable(s, e.item, playerObj, bans) then
+                        taken[id] = true
+                        s.short = s.short - amountOf(s, e.item)
+                    end
+                end
+            end
+        else
+            others[#others + 1] = src
+        end
+    end
+    sources = others
     for _, src in ipairs(sources) do src.d = distSq(playerObj, src) end
     table.sort(sources, function(a, b) return a.d < b.d end)
     local picks = {}
@@ -352,36 +398,83 @@ function F.beginChain(playerObj)
         secondary = playerObj:getSecondaryHandItem(), borrowed = {} }
 end
 
+-- Where fetched items go: the inventory, then the bags the player wears or
+-- holds. Each is filled up to its capacity, as vanilla lets a transfer do:
+-- the player may end up overloaded (slower) for the trip.
+function F.carryContainers(playerObj)
+    local inv = playerObj:getInventory()
+    local out = { inv }
+    local items = inv:getItems()
+    for i = 0, items:size() - 1 do
+        local it = items:get(i)
+        if instanceof(it, "InventoryContainer") and it:getInventory() and playerObj:isEquipped(it) then
+            out[#out + 1] = it:getInventory()
+        end
+    end
+    return out
+end
+
+-- the item with this id in the inventory or a bag it carries
 local function inInventory(playerObj, id)
-    return playerObj:getInventory():getItemById(id)
+    for _, c in ipairs(F.carryContainers(playerObj)) do
+        local item = c:getItemById(id)
+        if item then return item end
+    end
 end
 
--- weight the player can still carry before being overloaded
--- (ItemContainer:hasRoomFor only checks the item's size for the main inventory)
+-- weight a container can still take (getCapacityWeight lags behind items just
+-- added; getContentsWeight counts them)
+local function roomIn(playerObj, c)
+    return c:getEffectiveCapacity(playerObj) - c:getContentsWeight()
+end
+
+-- weight the player can still take in the inventory and the bags it wears or holds
 function F.freeWeight(playerObj)
-    return playerObj:getMaxWeight() - playerObj:getInventory():getContentsWeight()
+    local free = 0
+    for _, c in ipairs(F.carryContainers(playerObj)) do free = free + math.max(0, roomIn(playerObj, c)) end
+    return free
 end
 
--- trip steps from a plan, as much as the player can carry (at least one item)
+-- Trip steps from a plan, as much as the inventory and the worn bags hold
+-- (at least one item). Each item gets the container it goes into (e.dest).
 local function tripSteps(job, plan)
     local p = job.player
-    local free = F.freeWeight(p)
-    local steps, weight, full, count = {}, 0, false, 0
+    local inv = p:getInventory()
+    local bins = {}
+    for _, c in ipairs(F.carryContainers(p)) do
+        -- what goes into a worn bag also weighs on the inventory, less the bag's reduction
+        local bag = c ~= inv and c:getContainingItem()
+        local keep = bag and instanceof(bag, "InventoryContainer") and (1 - bag:getWeightReduction() / 100) or 1
+        bins[#bins + 1] = { c = c, free = roomIn(p, c), keep = keep, main = c == inv }
+    end
+    local main = bins[1]
+    -- tools stay in the inventory itself (the build equips them from there), and
+    -- floor items too: in multiplayer the server grabs into the inventory only
+    local function place(w, mainOnly)
+        for _, b in ipairs(bins) do
+            if (b.main or not mainOnly) and w <= b.free and (b.main or w * b.keep <= main.free) then
+                b.free = b.free - w
+                if not b.main then main.free = main.free - w * b.keep end
+                return b.c
+            end
+        end
+    end
+    local steps, full, count = {}, false, 0
     for _, entry in ipairs(plan) do
         local take = {}
         for _, e in ipairs(entry.items) do
-            local w = e.item:getUnequippedWeight()
-            if count == 0 or weight + w <= free then
+            local dest = place(e.item:getUnequippedWeight(), e.tool or entry.src.kind == "floor")
+            if not dest and count == 0 then dest = inv end
+            if dest then
                 count = count + 1
-                weight = weight + w
+                e.dest = dest
                 take[#take + 1] = e
             else
+                -- left for the next trip; a lighter item further on may still fit
                 full = true
-                break
             end
         end
         if #take > 0 then steps[#steps + 1] = { kind = "take", src = entry.src, items = take } end
-        if full then break end
     end
     if #steps == 0 then return nil end
     steps[#steps + 1] = { kind = "site" }
@@ -419,7 +512,7 @@ function F.start(playerObj, site, plan)
     for _, st in ipairs(job.steps) do
         if st.kind == "take" then n, sources = n + #st.items, sources + 1 end
     end
-    log("site", site.id, "fetching", n, "items from", sources, "sources")
+    log("site", site.id, "fetching", n, "items from", sources, "sources, room", string.format("%.1f", F.freeWeight(playerObj)))
     F.advance(job)
     return true
 end
@@ -468,7 +561,7 @@ local function queueTake(job, st)
                 if st.src.kind == "floor" then
                     ISTimedActionQueue.add(ISGrabItemAction:new(p, e.wo, ISWorldObjectContextMenu.grabItemTime(p, e.wo)))
                 else
-                    ISTimedActionQueue.add(ISInventoryTransferUtil.newInventoryTransferAction(p, e.item, st.src.container, inv))
+                    ISTimedActionQueue.add(ISInventoryTransferUtil.newInventoryTransferAction(p, e.item, st.src.container, e.dest or inv))
                 end
                 if oneAtATime() then break end
             end
@@ -479,10 +572,14 @@ end
 
 local function checkTake(job, st)
     local got, lost = 0, 0
+    -- a source where the site is built from should have counted as at hand (tests)
+    local stand = job.site and standOf(BuildAhead.keptStand(job.site))
+    if atHandOf(st.src, stand) then F.stats.rehandled = F.stats.rehandled + 1 end
     for _, e in ipairs(st.items) do
         local id = e.item:getID()
         if inInventory(job.player, id) then
             got = got + 1
+            F.stats.takes = F.stats.takes + 1
             job.carried[#job.carried + 1] = { id = id, tool = e.tool }
             if e.tool and F.chain then
                 table.insert(F.chain.borrowed, { id = id, src = st.src })
@@ -527,8 +624,15 @@ local function queueDrop(job)
     local n = 0
     queueOwn(job, function()
         while #job.dropIds > 0 do
-            local item = inInventory(p, table.remove(job.dropIds, 1))
-            if item then
+            local id = table.remove(job.dropIds, 1)
+            local item = inInventory(p, id)
+            if item and item:getContainer() ~= p:getInventory() then
+                -- a bag item is dropped from the inventory: take it out first, drop it next time
+                ISTimedActionQueue.add(ISInventoryTransferAction:new(p, item, item:getContainer(), p:getInventory()))
+                table.insert(job.dropIds, 1, id)
+                n = n + 1
+                break
+            elseif item then
                 local w = item:getUnequippedWeight()
                 for _, sq in ipairs(job.dropSquares) do
                     local cur = job.dropLoad[sq] or sq:getTotalWeightOfItemsOnFloor()
@@ -573,10 +677,14 @@ local function replan(job)
         return
     end
     if job.trips >= F.MAX_TRIPS then return failSite(job, "too many trips") end
-    local psq = p:getCurrentSquare()
+    -- at hand: around the square the site is built from (where the player stands now)
     local plan, missing = BuildAhead.fetchPlan(p, site, BuildAhead.freshContainers(p),
-        { x = psq:getX(), y = psq:getY(), z = psq:getZ() })
+        BuildAhead.keptStand(site) or p:getCurrentSquare())
     if not plan or #plan == 0 then
+        if plan then
+            -- the plan sees everything at hand but the build does not: say what it lacks
+            pcall(function() log("site", site.id, "build lacks", BuildAhead.lackingNow(p, site)) end)
+        end
         return failSite(job, plan and "materials not usable" or ("missing " .. table.concat(missing or {}, ", ")))
     end
     local steps = tripSteps(job, plan)

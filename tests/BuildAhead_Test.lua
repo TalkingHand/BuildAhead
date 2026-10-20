@@ -15,10 +15,15 @@
 --   9. fetching: with nothing in the bag, a wall frame and a stick fence are built from a
 --      crate and the floor 5-10 tiles away; a locked crate, a walled-in square, a source that
 --      vanishes and banned items are left alone; the hammer goes back to its crate and the
---      weapon held before is equipped again; everything fits in one trip each, so nothing is
---      dropped at the sites: the builds take the materials from the inventory
---  10. multi-trip: with little room in the bag, the first trip drops its load at the site,
---      the last one builds from the inventory
+--      weapon held before is equipped again; with the vanilla carry limit (no raised max
+--      weight) everything fits in one trip each, since a trip fills the inventory up to its
+--      capacity, so nothing is dropped at the sites: the builds take the materials from the
+--      inventory; nothing is taken from where a site is built from
+--  10. multi-trip: with little room in the inventory and the worn bags, the first trip drops
+--      its load at the site, the last one builds from the inventory; the dropped load is not
+--      picked up again
+--  10b. at hand: planks and nails lying on a wall frame's square are used where they lie:
+--      no fetch, nothing taken, the frame is built from them
 --  11. skill too low
 --  12. self-enclosure: a 3x3 room of walls with a gap in its north side, the player inside;
 --      the wall frame planned in the gap is built from outside and the player ends up outside;
@@ -596,10 +601,7 @@ local function fetchStart()
     end
     local bat = inv:AddItem("Base.BaseballBat")
     p:setPrimaryHandItem(bat)
-    -- room for each site's materials in one trip (phase 10 restores the limit)
-    T.maxWeight, T.maxWeightBase = p:getMaxWeight(), p:getMaxWeightBase()
-    p:setMaxWeightBase(50)
-    p:setMaxWeight(50)
+    -- the vanilla carry limit: a trip fills the inventory up to its capacity anyway
     T.bat = bat
     for _ = 1, 2 do inv:AddItem("Base.RippedSheets") end
     BuildAhead.setBanned(p, "Base.LongStick", true)
@@ -669,6 +671,7 @@ local function fetchStart()
 
     log("fetch setup: clicking")
     T.drops = BuildAheadFetch.stats.drops
+    T.rehandled = BuildAheadFetch.stats.rehandled
     local c = makeCursor(T.info)
     c:tryBuild(T.W.x, T.W.y, T.W.z)
     check("9 click starts fetching", BuildAheadFetch.isActive(p))
@@ -714,6 +717,8 @@ local function fetchDone()
     check("9 weapon equipped again", p:getPrimaryHandItem() == T.bat, tostring(p:getPrimaryHandItem()))
     check("9 last trips build from the inventory: nothing dropped", BuildAheadFetch.stats.drops == T.drops,
         "drops " .. (BuildAheadFetch.stats.drops - T.drops))
+    check("9 nothing taken from where a site is built from", BuildAheadFetch.stats.rehandled == T.rehandled,
+        "takes " .. (BuildAheadFetch.stats.rehandled - T.rehandled))
     BuildAhead.setBanned(p, "Base.LongStick", false)
 end
 
@@ -725,13 +730,19 @@ local function multiStart()
     local hammerW = instanceItem("Base.BallPeenHammerForged"):getUnequippedWeight()
     local nailsW = instanceItem("Base.Nails"):getUnequippedWeight()
     local target = 2 * plankW + hammerW -- no room for this
-    p:setMaxWeightBase(T.maxWeightBase)
-    p:setMaxWeight(T.maxWeight)
     T.filler = {}
+    local function room(c) return c:getEffectiveCapacity(p) - c:getContentsWeight() end
+    -- worn bags full (a pencil's weight at most left), so the room is the inventory's
+    local pencilW = instanceItem("Base.Pencil"):getUnequippedWeight()
+    for _, c in ipairs(BuildAheadFetch.carryContainers(p)) do
+        if c ~= inv then
+            while room(c) >= pencilW and #T.filler < 1000 do T.filler[#T.filler + 1] = c:AddItem("Base.Pencil") end
+        end
+    end
     -- leave less free weight than `target`, but no less than `target` minus a pencil
     local function fill(fullType, keep)
         local w = instanceItem(fullType):getUnequippedWeight()
-        while BuildAheadFetch.freeWeight(p) >= target + (keep and w or 0) and #T.filler < 500 do
+        while BuildAheadFetch.freeWeight(p) >= target + (keep and w or 0) and #T.filler < 1000 do
             T.filler[#T.filler + 1] = inv:AddItem(fullType)
         end
     end
@@ -762,6 +773,7 @@ local function multiStart()
     addTo(crate, "Base.Nails", 2)
     T.mcrate = crate
     T.drops = BuildAheadFetch.stats.drops
+    T.rehandled = BuildAheadFetch.stats.rehandled
     local c = makeCursor(T.info)
     c:tryBuild(T.M.x, T.M.y, T.M.z)
     check("10 click starts fetching", BuildAheadFetch.isActive(p))
@@ -821,7 +833,8 @@ local function multiDone()
     local inv = p:getInventory()
     local drops = BuildAheadFetch.stats.drops - T.drops
     check("10 wall frame built over several trips", hasObject(T.M.x, T.M.y, T.M.z, "WoodenWallFrame"))
-    check("10 only the first trip dropped its load (one plank)", drops == 1, "drops " .. drops)
+    -- the first trip takes the hammer, one plank and the nails (they still fit), and drops all but the hammer
+    check("10 only the first trip dropped its load (one plank, two nails)", drops == 3, "drops " .. drops)
     local left = floorCount(T.M, "Base.Plank", 2) + floorCount(T.M, "Base.Nails", 2)
         + inv:getCountTypeRecurse("Base.Plank") + inv:getCountTypeRecurse("Base.Nails")
         + T.mcrate:getCountTypeRecurse("Base.Plank") + T.mcrate:getCountTypeRecurse("Base.Nails")
@@ -829,8 +842,66 @@ local function multiDone()
     if cheb(T.U, T.M) <= 2 then left = left - floorCount(T.U, "Base.Plank") end
     check("10 materials consumed", left == 0, "left " .. left)
     check("10 hammer back in the crate", hammerCount(T.mcrate) == 1 and hammerCount(inv) == 0)
+    check("10 dropped load not picked up again", BuildAheadFetch.stats.rehandled == T.rehandled,
+        "takes " .. (BuildAheadFetch.stats.rehandled - T.rehandled))
     for _, it in ipairs(T.filler or {}) do
         if it:getContainer() then it:getContainer():DoRemoveItem(it) end
+    end
+end
+
+-- 10b. at hand: the materials lie on the site's own square, the player a few tiles away
+local function atHandStart()
+    local p = player()
+    local inv = p:getInventory()
+    for _, t in ipairs({ "Base.Plank", "Base.Nails" }) do
+        for _ = 1, 50 do
+            local it = inv:getFirstTypeRecurse(t)
+            if not it then break end
+            it:getContainer():DoRemoveItem(it)
+        end
+    end
+    if hammerCount(inv) == 0 then inv:AddItem("Base.BallPeenHammerForged") end
+    local avoid = {}
+    for _, k in ipairs({ "W", "F", "L", "V", "U", "Cr", "Fl", "M", "Mc" }) do
+        if T[k] then avoid[#avoid + 1] = T[k] end
+    end
+    local q
+    for _, c in ipairs(validSquares(T.info)) do
+        local ok = c.d >= 16 -- 4 tiles or more: the floor there is not at hand where the player is
+        for _, a in ipairs(avoid) do if ok and cheb(a, c) < 3 then ok = false end end
+        if ok then q = c break end
+    end
+    if not q then
+        check("10b at-hand square", false)
+        return false
+    end
+    q.sq = getCell():getGridSquare(q.x, q.y, q.z)
+    T.H = q
+    addFloor(q, "Base.Plank", 2)
+    addFloor(q, "Base.Nails", 2)
+    check("10b square still valid with the materials on it", makeCursor(T.info):isValid(q.sq))
+    T.takes = BuildAheadFetch.stats.takes
+    local c = makeCursor(T.info)
+    c:tryBuild(q.x, q.y, q.z)
+    check("10b click builds without fetching", not BuildAheadFetch.isActive(p) and BuildAhead.isBusy(p))
+    T.phase = "atHandRun"
+    T.idleSince = nil
+    T.fetchStart = T.tick
+    return true
+end
+
+local function atHandDone()
+    local p = player()
+    local q = T.H
+    local inv = p:getInventory()
+    check("10b wall frame built from the materials lying there", hasObject(q.x, q.y, q.z, "WoodenWallFrame"))
+    check("10b nothing taken", BuildAheadFetch.stats.takes == T.takes, "takes " .. (BuildAheadFetch.stats.takes - T.takes))
+    local left = floorCount(q, "Base.Plank", 1) + floorCount(q, "Base.Nails", 1)
+        + inv:getCountTypeRecurse("Base.Plank") + inv:getCountTypeRecurse("Base.Nails")
+    check("10b materials consumed", left == 0, "left " .. left)
+    local items = inv:getItems()
+    for i = items:size() - 1, 0, -1 do
+        if isHammer(items:get(i)) then inv:DoRemoveItem(items:get(i)) end
     end
 end
 
@@ -1188,12 +1259,32 @@ local function onTick()
         if T.idleSince and t - T.idleSince > 180 then
             local ok, err = pcall(multiDone)
             if not ok then phaseError("multiDone", err) end
-            local ok2, err2 = pcall(skillChecks)
-            if not ok2 then phaseError("skillChecks", err2) end
-            T.phase = "trap"
+            T.phase = "atHand"
         elseif t - T.fetchStart > 60 * 600 then
             check("10 multi-trip chain finished in time", false)
             T.phase = "quit"
+        end
+    elseif T.phase == "atHand" then
+        local ok, res = pcall(atHandStart)
+        if not ok then phaseError("atHandStart", res) end
+        if not (ok and res) then
+            local ok2, err2 = pcall(skillChecks)
+            if not ok2 then phaseError("skillChecks", err2) end
+            T.phase = "trap"
+        end
+    elseif T.phase == "atHandRun" then
+        local busy = BuildAhead.isBusy(p) or #ISTimedActionQueue.getTimedActionQueue(p).queue > 0
+        if busy then T.idleSince = nil elseif not T.idleSince then T.idleSince = t end
+        if T.idleSince and t - T.idleSince > 180 then
+            local ok, err = pcall(atHandDone)
+            if not ok then phaseError("atHandDone", err) end
+            -- after 10b: it lowers the woodwork level the frames need
+            local ok2, err2 = pcall(skillChecks)
+            if not ok2 then phaseError("skillChecks", err2) end
+            T.phase = "trap"
+        elseif t - T.fetchStart > 60 * 300 then
+            check("10b at-hand build finished in time", false)
+            T.phase = "trap"
         end
     elseif T.phase == "trap" then
         local ok, res = pcall(trapStart)

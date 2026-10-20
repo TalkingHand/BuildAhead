@@ -307,6 +307,83 @@ function T.standSquare(playerObj, r)
     return best, false
 end
 
+T.key = key
+
+-- Squares to build an object from when it blocks nothing (a frame, a door: they
+-- can be passed): around its tiles, the tiles themselves included. Same shape
+-- as T.evaluate's result; preferred: the two sides of a wall-like object's edge.
+function T.standsAround(e, x, y, z)
+    local b = T.blockage(e, x, y)
+    local cell = getCell()
+    local result = { trap = false, safe = {}, trapped = {}, preferred = {} }
+    local seen = {}
+    local tiles = #b.tiles > 0 and b.tiles or { { x = x, y = y } }
+    for _, t in ipairs(tiles) do
+        for dx = -1, 1 do
+            for dy = -1, 1 do
+                local k = key(t.x + dx, t.y + dy)
+                if not seen[k] then
+                    seen[k] = true
+                    local sq = cell:getGridSquare(t.x + dx, t.y + dy, z)
+                    if sq and canStand(sq, b) then result.safe[#result.safe + 1] = sq end
+                end
+            end
+        end
+    end
+    if e and e.isWallLike then
+        result.preferred[key(x, y)] = true
+        if e.north then result.preferred[key(x, y - 1)] = true else result.preferred[key(x - 1, y)] = true end
+    end
+    return result
+end
+
+-- Steps from `start` to each of `squares` on its level, walking around walls
+-- (a door counts as open: the player opens it on the way). Returns
+-- {key = steps} for the squares reached within `radius` of start.
+function T.pathDistances(start, squares, radius)
+    local z = start:getZ()
+    local sx, sy = start:getX(), start:getY()
+    local want, left = {}, 0
+    for _, sq in ipairs(squares) do
+        local k = key(sq:getX(), sq:getY())
+        if sq:getZ() == z and not want[k] then
+            want[k] = true
+            left = left + 1
+        end
+    end
+    local out = {}
+    local function reach(k, d)
+        if want[k] then
+            out[k], want[k] = d, nil
+            left = left - 1
+        end
+    end
+    reach(key(sx, sy), 0)
+    local cell = getCell()
+    local seen = { [key(sx, sy)] = true }
+    local queue, dists, head = { start }, { 0 }, 1
+    while head <= #queue and left > 0 do
+        local a, d = queue[head], dists[head]
+        head = head + 1
+        local ax, ay = a:getX(), a:getY()
+        for _, dd in ipairs(DIRS) do
+            local bx, by = ax + dd[1], ay + dd[2]
+            local k = key(bx, by)
+            if not seen[k] and math.abs(bx - sx) <= radius and math.abs(by - sy) <= radius then
+                local sq = cell:getGridSquare(bx, by, z)
+                -- seen only once entered: a square behind a wall may be reached another way
+                if sq and walkable(sq) and (not a:isBlockedTo(sq) or call(a, "isDoorTo", sq)) then
+                    seen[k] = true
+                    queue[#queue + 1] = sq
+                    dists[#dists + 1] = d + 1
+                    reach(k, d + 1)
+                end
+            end
+        end
+    end
+    return out
+end
+
 -- trapped squares listed for the log
 function T.squares(list)
     local out = {}
