@@ -1256,7 +1256,13 @@ local function hookWalks()
             self.buildAheadInUpdate = true
             local ok, err = pcall(origUpdate, self, ...)
             self.buildAheadInUpdate = nil
-            if not ok then error(err) end
+            if not ok then
+                -- don't rethrow: under -debug error() opens the debugger and freezes the game.
+                -- Stop the walk like a takeover, so the chain stops instead of retrying.
+                log("walk update error", err)
+                self.buildAheadTookOver = true
+                pcall(self.forceStop, self)
+            end
         end
         class.forceStop = function(self, ...)
             if self.buildAheadInUpdate then self.buildAheadStopInUpdate = true end

@@ -1,0 +1,155 @@
+# BuildAhead: vanilla dependencies (format: _guide/README.md "9. 게임 업데이트 대응")
+# checked: 42.21.0
+# Java methods below are also listed in tools/java-calls.json: python -I ../_tools/jcheck.py <jar> tools/java-calls.json
+# (existence only; behaviour is what the assume lines are for)
+#
+# Mod files (Contents/mods/BuildAhead/42/media/lua): BA = client/BuildAhead.lua, F = client/BuildAhead_Fetch.lua,
+# T = client/BuildAhead_Trap.lua, UI = client/BuildAhead_BanUI.lua, SV = server/BuildAhead_Server.lua,
+# IN = shared/BuildAhead_Inputs.lua, SI = shared/BuildAhead_Sites.lua. Vanilla paths are relative to media/lua.
+#
+# Riskiest (break silently):
+#  1. ISBuildIsoEntity:isValid/tryBuild/walkTo hooks: blockBuild first in isValid, DoTileBuilding click flow
+#  2. ISBuildingObject:tryBuild internals (copyTable carries custom fields, self.player, startCraftAction before walkTo, cheat skips walkTo)
+#  3. BuildLogic manual-input Java API (barely used by vanilla Lua, mostly pcall'd: breaks as "materials missing")
+#  4. MP server: entity rebuilt from new() args, .containers on server copy, server-side player ModData for bans
+#  5. walk hooks: takeover vs failure told apart by forceStop() being called from inside update()
+#  6. build window UI internals (ISWidgetInput, ISCraftInventoryPanel, ISWidgetBuildControl): not pcall'd
+#  7. ISBuildAction lifecycle + MP perform returning early on the client (CHECK_DELAY_MS)
+#  8. constants copied from vanilla (50 weight floor cap, wall/door property lists, vehicle part ids)
+#  9. global ModData sync (OnReceiveGlobalModData, ModData.add/request): no vanilla Lua uses them
+#
+# kind	target	note
+
+## Wrapped vanilla functions (all installed on Events.OnGameStart unless noted)
+lua-wrap	ISBuildIsoEntity:isValid	BA:909-931; server/BuildingObjects/ISBuildIsoEntity.lua:435. Original called (blockBuild forced false while planning, pcall)
+lua-wrap	ISBuildIsoEntity:tryBuild	BA:933-945; ISBuildIsoEntity.lua:858. Original NOT called for planning cursors (stores a site), called for scheduler entities
+lua-wrap	ISBuildIsoEntity:walkTo	BA:1216-1221; ISBuildIsoEntity.lua:9. Original skipped when self.buildAheadStand is set (queues ISPathFindAction instead)
+lua-wrap	ISBuildIsoEntity:create	SV:78-92; ISBuildIsoEntity.lua:501. Original always called, after re-filling inputs without banned types. Dedicated server only (isServer); file load + OnGameBoot + OnServerStarted
+lua-wrap	ISBuildAction:start	BA:953-973; client/BuildingObjects/TimedActions/ISBuildAction.lua:127. Original called after container/input refresh + stopCraftAction/startCraftAction(self)
+lua-wrap	ISBuildAction:stop / forceStop	BA:977-991; ISBuildAction.lua:156,184. Original called (unclaims site)
+lua-wrap	ISBuildAction:perform	BA:993-1019; ISBuildAction.lua:201. Original called first, then chain scheduling
+lua-wrap	ISWidgetBuildControl:prerender	BA:1200-1211; client/Entity/ISUI/BuildRecipe/ISWidgetBuildControl.lua:159. Original called, then buttonCraft.enable forced true
+lua-wrap	ISPathFindAction.update / stop	BA:1253-1271; client/Vehicles/TimedActions/ISPathFindAction.lua:9,68. Original called (update in pcall)
+lua-wrap	ISPathFindAction.forceStop	BA:1261-1264; inherited from shared/TimedActions/ISBaseTimedAction.lua:28 (not defined on the class)
+lua-wrap	ISWalkToTimedAction.update / stop	BA:1253-1271; client/TimedActions/WalkToTimedAction.lua:10,46. Original called (update in pcall)
+lua-wrap	ISWalkToTimedAction.forceStop	BA:1261; inherited from ISBaseTimedAction.lua:28
+lua-wrap	ISWidgetInput:createChildren	UI:51-64; client/Entity/ISUI/CraftRecipe/ISWidgetInput.lua:13. Original called, then an ISButton is added
+lua-wrap	ISWidgetInput:onMouseDownOutside / onMouseDown	UI:67-76; ISWidgetInput.lua:303,290. Original skipped when the ban button is hovered
+lua-wrap	ISWidgetInput:calculateLayout	UI:78-85; ISWidgetInput.lua:70. Original called
+lua-wrap	ISWidgetInput:updateValues	UI:87-111; ISWidgetInput.lua:483 (vanilla calls it every frame from prerender:156). Original called
+lua-wrap	ISCraftInventoryPanel.drawListItem	UI:139-160; client/Entity/ISUI/CraftRecipe/ISCraftInventoryPanel.lua:478 (copied into itemListBox.doDrawItem at :102). Original called
+lua-wrap	ISCraftInventoryPanel:createChildren	UI:162-181; ISCraftInventoryPanel.lua:13. Original called, then itemListBox.onMouseDown replaced per instance (falls back to ISScrollingListBox:onMouseDown, client/ISUI/ISScrollingListBox.lua:577)
+
+## Vanilla Lua called
+lua-call	ISBuildIsoEntity:new(char, info, nSprite, containers)	BA:251; ISBuildIsoEntity.lua:875 (without a logic it makes its own BuildLogic.new + setContainers + setRecipe)
+lua-call	ISBuildIsoEntity.GetAllBuildableEntities	BA:79; ISBuildIsoEntity.lua:950
+lua-call	ISBuildIsoEntity.predicateMaterial	BA:201, F:224,260, IN:46; ISBuildIsoEntity.lua:1107
+lua-call	ISBuildIsoEntity:getSprite / getFace	BA:264,288; ISBuildIsoEntity.lua:775, server/BuildingObjects/ISBuildingObject.lua:482
+lua-call	ISBuildingObject:tryBuild (via ISBuildIsoEntity:tryBuild)	BA:737; ISBuildingObject.lua:176
+lua-call	ISBuildMenu.cheat (read)	BA:736; client/BuildingObjects/ISUI/ISBuildMenu.lua:2 (= getDebug())
+lua-call	ISBuildWindow.instance (an ISBuildPanel)	BA:680; set in client/Entity/ISUI/BuildRecipe/ISBuildPanel.lua:478
+lua-call	ISBuildPanel:updateContainers(true) / createBuildIsoEntity(true)	BA:683,685; ISBuildPanel.lua:214,310
+lua-call	ISEntityBuildMenu.onBuildEntity (mirrored, not called)	BA:248; client/Entity/ISUI/ISEntityBuildMenu.lua:118 (local getTool :95 copied as BA:195)
+lua-call	ISTimedActionQueue.add / getTimedActionQueue(...).queue	BA:472,653, F:374,526; client/TimedActions/ISTimedActionQueue.lua:143,148,157
+lua-call	ISPathFindAction:pathToLocationF / pathToVehicleArea	BA:472, F:525; ISPathFindAction.lua:122,172
+lua-call	ISInventoryTransferUtil.newInventoryTransferAction	F:564; shared/TimedActions/ISInventoryTransferUtil.lua:14
+lua-call	ISInventoryTransferAction:new(p, item, src, dest)	F:631,730; client/TimedActions/ISInventoryTransferAction.lua:764
+lua-call	ISGrabItemAction:new(p, worldObj, time)	F:562; client/TimedActions/ISGrabItemAction.lua:182
+lua-call	ISWorldObjectContextMenu.grabItemTime	F:562; client/ISUI/ISWorldObjectContextMenu.lua:1403
+lua-call	ISDropWorldItemAction:new(p, item, sq, xo, yo, zo, rot, false)	F:641,727; shared/TimedActions/ISDropWorldItemAction.lua:157
+lua-call	ISUnequipAction:new(p, item, 50)	F:725; shared/TimedActions/ISUnequipAction.lua:148
+lua-call	ISOpenVehicleDoor:new(p, vehicle, part)	F:757; shared/Vehicles/TimedActions/ISOpenVehicleDoor.lua:142
+lua-call	ISInventoryPaneContextMenu.getContainers / equipWeapon	BA:209-321, F:808; client/ISUI/ISInventoryPaneContextMenu.lua:2425,3731
+lua-call	luautils.walkAdj(p, sq, true) / walkToContainer	F:529,708; shared/luautils.lua:119,306 (walkToContainer can error() on vehicles; pcall'd)
+lua-call	AdjacentFreeTileFinder.Find(sq, player)	F:216; shared/Util/AdjacentFreeTileFinder.lua:135
+lua-call	getPlayerLoot(n):refreshBackpacks()	BA:216; client/ISUI/PlayerData/ISPlayerData.lua:93, client/ISUI/ISInventoryPage.lua:1537
+lua-call	getPlayerInventory(n).inventoryPane.inventoryPage.backpacks[i].inventory	BA:224,1090; ISInventoryPage.lua:89
+lua-call	ISToolTip / ISButton / ISScrollingListBox / ISContextMenu:addOption	BA:1178-1193, UI:57-173; client/ISUI/ISToolTip.lua, ISButton.lua, ISScrollingListBox.lua, ISContextMenu.lua, ISUIElement.lua
+lua-field	ISBuildIsoEntity: character, objectInfo, nSprite, north, player, blockBuild, buildPanelLogic, containers, previousStages, isWallLike, dragNilAfterPlace, blockAfterPlace, equipBothHandItem, firstItem, secondItem	BA:252-264,609,884-917; ISBuildIsoEntity.lua:875-948, ISBuildingObject.lua:438-480
+lua-field	ISBuildAction: item, character, x, y, z, Type=="ISBuildAction"	BA:660,955,980-1016; ISBuildAction.lua:257-266
+lua-field	action.Type "ISPathFindAction"/"ISWalkToTimedAction", .character	BA:741,1231,1255; shared/ISBaseObject.lua:13 (derive sets Type)
+lua-field	ISBuildPanel: player, logic	BA:681-684; ISBuildPanel.lua:454,462
+lua-field	ISWidgetBuildControl: buttonCraft(.enable), logic, player	BA:1205-1207; ISWidgetBuildControl.lua:43,254
+lua-field	ISWidgetInput: logic, player, inputScript, displayAsOutput, labelIconSize, primary.inputFullName, primary.icon.backgroundColor, borderColor	UI:40-100; ISWidgetInput.lua:23,185-205,242,605-631
+lua-field	ISCraftInventoryPanel: logic, player, itemListBox(.items[row].item, .itemheight, .width, .vscroll, .target); row .isHeader/.fluid/.script	UI:118-168; ISCraftInventoryPanel.lua:20-104,394-460,716
+lua-field	ISButton: font, borderColor, backgroundColor, textColor, mouseovertext	UI:58-109; ISButton.lua:252
+
+## Java (method existence: tools/java-calls.json)
+java-call	IsoPlayer: getUsername, getModData, getInventory, getPlayerNum, pressedMovement(false), pressedCancelAction, isBuildCheat, getCurrentSquare, getX/Y/Z, setHaloNote, isLocalPlayer, getPrimary/SecondaryHandItem, isEquipped, isDead
+java-call	ModData: getOrCreate, add, request, transmit	SI:12, BA:155,1288, SV:62 (add/request: no vanilla Lua usage)
+java-call	GameTime:getWorldAgeHours	BA:118,710, SV:37
+java-call	ObjectInfo: getName, getRecipe():getCraftRecipe()	BA:80,257,353,418,609
+java-call	CraftRecipe: getToolBoth/Right/Left, getInputs, getRequiredSkillCount, getRequiredSkill, characterHasRequiredSkills, getTranslationName; CraftRecipeManager.hasPlayerRequiredSkill	BA:260-262,420-432,1116
+java-call	InputScript: getPossibleInputItems, isAutomationOnly, getResourceType, getIntAmount, getAmount, isItemCount, isTool, isKeep, canUseItem	BA:197,302-306, F:225,246-255, IN:38-41, UI:55
+java-call	BuildLogic: setContainers, setRecipe, getRecipe, getRecipeData, is/setManualSelectInputs, autoPopulateInputs, clearManualInputsFor, offerInputItem, canPerformCurrentRecipe, getInputCount, refresh, stop/startCraftAction, getSelectedBuildObject; BuildLogic.new	BA:322-354,684,965, IN:22-49, SV:85, UI:19
+java-call	CraftRecipeData: getRecipe, getDataForInputScript; InputScriptData: getAppliedItemsCount, getAppliedItem, isInputItemsSatisfied	BA:234-240, F:243-248, IN:32-54
+java-call	ItemContainer: getAllTypeEvalRecurse, isEmpty, isLockedToCharacter, getItems, getItemById, getEffectiveCapacity, getContentsWeight, getContainingItem	BA:201, F:73-446
+java-call	InventoryItem / DrainableComboItem / InventoryContainer: getFullType, getID, getContainer, getUnequippedWeight, isEquipped, getCurrentUses, getInventory, getWeightReduction	F:223-636
+java-call	IsoGridSquare: getWorldObjects, getObjects, getDeadBodys, getVehicleContainer, canReachTo, TreatAsSolidFloor, isBlockedTo, getTotalWeightOfItemsOnFloor, isFree, HasStairs, isDoorTo, isWindowTo, isHoppableTo, getWindowFrameTo	F:99-638, T:140-375
+java-call	BaseVehicle / VehiclePart / VehicleDoor: getId, getDriver, isTrunkLocked, getPart*, canAccessContainer, getItemContainer, getArea, getDoor, isLocked, isOpen	F:79-755
+java-call	IsoSprite: getProperties, getType, RenderGhostTileColor (7 args); PropertyContainer: has, getFlagsList; FaceInfo/TileInfo	BA:543-1127, T:36-106
+java-call	SafeHouse.isSafehouseAllowLoot(sq, player)	F:67 (same as client/ISUI/ISInventoryPage.lua:1685)
+java-call	globals: sendClientCommand, sendServerCommand, getSprite, getTimestampMs, ZombRand, getScriptManager, getTextManager, getSoundManager
+data	enums: ResourceType.Item; IsoObjectType.doorW/N, doorFrW/N; IsoPropertyType WALL_*, WINDOW_*, DOOR_WALL_*; IsoFlagType doorN/W, Wall*, DoorWall*, Window*, window*, Hoppable*, collide*, solid, solidtrans	BA:302-873, T:47-85
+
+## Events
+event	Events.OnGameStart	BA:1313 (installHooks, ModData.request, getBans), UI:191
+event	Events.OnReceiveGlobalModData(key, data)	BA:1314 (no vanilla Lua listener)
+event	Events.OnServerCommand	BA:1315; module "BuildAhead", command "bans"
+event	Events.OnTick / OnPostRender	BA:1316-1317
+event	Events.OnFillWorldObjectContextMenu	BA:1318; client/ISUI/ISWorldObjectContextMenu.lua:213
+event	Events.OnInitGlobalModData / OnGameBoot / OnServerStarted	SV:95-98
+event	Events.OnClientCommand	SV:99; module "BuildAhead", commands add/remove/claim/unclaim/bans/getBans
+
+## Data
+data	global ModData "BuildAhead" {sites, nextId}	SI:8-15
+data	player ModData "BuildAheadBans"	BA:164, SV:13
+data	vehicle part ids GloveBox, Seat*, TrunkDoor, DoorRear, TrunkDoorOpened, TruckBedOpen	F:81-131; trunk door lookup same as server/Vehicles/Vehicles.lua:27
+data	UI sound "UIActivateButton"	UI:175; scripts/generated/sounds/sounds_ui.txt
+data	ban keys = item full types from InputScript possible items	BA:161-175, IN:43
+data	type name strings "ISBuildAction", "ISPathFindAction", "ISWalkToTimedAction", "BuildLogic", "IsoThumpable", "InventoryContainer", "DrainableComboItem"	BA:660,741, UI:19, F:72,230,410
+
+## Assumptions
+assume	isValid returns false while blockBuild is set; build panel sets blockBuild = not canPerform or craft in progress	BA:13-16,917; ISBuildIsoEntity.lua:436, ISBuildPanel.lua:323-332
+assume	render() sets isWallLike only while drawing the cursor; reset sets false. Mod copies render's property list	BA:535-539; ISBuildIsoEntity.lua:86-90, ISBuildingObject.lua:457
+assume	new() sets dragNilAfterPlace=true; tryBuild then setDrag(nil)	BA:253-256; ISBuildIsoEntity.lua:911, ISBuildingObject.lua:209
+assume	tryBuild needs self.player (normally set by setDrag, Java, unverified)	BA:252; ISBuildingObject.lua:179
+assume	tryBuild hands a copyTable copy to ISBuildAction (custom fields buildAheadSite/Stand travel with it) and calls startCraftAction before walkTo	BA:727; ISBuildingObject.lua:194-206
+assume	BuildLogic:startCraftAction copies the inputs at call time, so restarting it in ISBuildAction:start picks up refreshed inputs	BA:964-966 (Java, unverified)
+assume	with ISBuildMenu.cheat (on under -debug) tryBuild skips walkTo	BA:734-736; ISBuildingObject.lua:208. Tests under -debug don't exercise vanilla walkTo
+assume	vanilla wall walkTo uses AdjacentFreeTileFinder.FindWall (straight-line nearest, not by path); stairs path to the bottom	BA:477-481; ISBuildIsoEntity.lua:16-30, AdjacentFreeTileFinder.lua:289
+assume	walkAdj/walkAdjWall clear the action queue unless keepActions	F:529; luautils.lua:119,212,398
+assume	ISWalkToTimedAction is invalid at game speed > 2, so walks to a stand use ISPathFindAction	BA:465; WalkToTimedAction.lua:7
+assume	walks stop from update() via self:forceStop() on movement/cancel key and on BehaviorResult.Failed; stop() follows. Takeover vs failure told apart by flags around update/forceStop	BA:1234,1252-1264; ISPathFindAction.lua:9-31, WalkToTimedAction.lua:10-22 (Java forceStop -> Lua stop ordering unverified)
+assume	BuildAhead.tookOver mirrors vanilla pressedMovement(false) or pressedCancelAction()	BA:149-151
+assume	ISBuildAction start/stop/forceStop/perform lifecycle; in MP perform returns early on the client and the object arrives later	BA:700 CHECK_DELAY_MS=1000, BA:1037; ISBuildAction.lua:213-220
+assume	in MP, ISBuildAction:start overwrites item.containers with getContainers right after the mod's wrapper	ISBuildAction.lua:147-149 vs BA:961
+assume	getTool returns a full-type string for equipBothHandItem/firstItem/secondItem; vanilla tryBuild calls :getContainer() on equipBothHandItem, so a both-hands tool errors (in vanilla too)	BA:195-260; ISEntityBuildMenu.lua:95-127, ISBuildingObject.lua:231-235, luautils.lua:444
+assume	build panel autoPopulates inputs while dragging; a headless entity has none unless filled	BA:265-266; ISBuildPanel.lua:301-305
+assume	BuildLogic:isInputSatisfied answers from a stale cache until an offer succeeds, so fill uses InputScriptData:isInputItemsSatisfied	IN:39-40 (Java, unverified)
+assume	no bans = plain autoPopulateInputs; bans = clearManualInputsFor + offerInputItem	IN:17-57 (Java, unverified)
+assume	MP server rebuilds the entity from ISBuildIsoEntity.new args and picks inputs itself; the client's choice doesn't reach it	IN:3-5, SV:5-6, BA:181 (zombie/core/BuildAction, unverified). See notes/2026-10-19_mp_analysis.md
+assume	server-side entity has .containers as a Java list, else fall back to inventory	SV:67-73 (unverified)
+assume	server create calls startCraftAction(nil) then performCurrentRecipe, after the mod's fill	SV:79-91; ISBuildIsoEntity.lua:507-546
+assume	server's copy of player ModData (bans) persists and isn't overwritten by client sync	SV:4-6,54,59, BA:1289-1310 (unverified)
+assume	ISBuildIsoEntity (server/ file) hook goes in OnGameStart; dedicated server via OnGameBoot/OnServerStarted	BA:36-37, SV:96-98
+assume	ModData.transmit from the server reaches every client as OnReceiveGlobalModData; ModData.add replaces the local copy; ModData.request pulls it	SI:1-4, SV:62, BA:153-157,1288
+assume	OnClientCommand(module, command, player, args) argument order	BA:95, SV:21
+assume	in MP, item moves queued together fail after the first, so they are queued one at a time	F:546-548 (createItemTransaction, unverified)
+assume	SETTLE_MS=400 lets MP item moves arrive after the queue empties	F:35
+assume	ISDropWorldItemAction refuses more than 50 weight per square (copied constant); dropped item must be in the main inventory	F:38,629-634; ISDropWorldItemAction.lua:5-18
+assume	ISGrabItemAction always grabs into the main inventory	F:451-452; ISGrabItemAction.lua:192
+assume	bag weight reduction applies to main inventory weight; getCapacityWeight lags behind items just added, getContentsWeight doesn't	F:401-448 (unverified)
+assume	materials at hand = inventory + loot-window containers + floor 3x3, as vanilla getContainers / GetAllGroundItemsForPlayer	F:3-5; ISInventoryPaneContextMenu.lua:2425, ISBuildIsoEntity.lua:1111
+assume	loot window refreshes backpacks a frame later (e.g. after a drop)	BA:213-219 (unverified)
+assume	TruckBedOpen accessible even with the trunk locked; TrunkDoor/DoorRear gate the trunk	F:84-86,126-129; server/Vehicles/Vehicles.lua:24-40
+assume	locked IsoThumpable containers excluded, as vanilla getContainers	F:71-75; ISInventoryPaneContextMenu.lua:2433-2436
+assume	safehouse looting rule applies only in MP	F:65-68; ISInventoryPage.lua:1685
+assume	previous stage / door frame detection mirrors isValidPerSquare	BA:863-905; ISBuildIsoEntity.lua:236-302
+assume	nSprite 1-4 maps to W/N/E/S through getFace	BA:264, SI:37; ISBuildIsoEntity.lua:775-809
+assume	DoTileBuilding calls tryBuild on each click when isValid passes; isValid runs every frame from render	BA:934-945; ISBuildingObject.lua:97-175, ISBuildIsoEntity.lua:72
+assume	ISWidgetBuildControl:prerender resets buttonCraft.enable every frame	BA:1197-1209; ISWidgetBuildControl.lua:164-172
+assume	ISWidgetInput:updateValues runs every frame and resets primary.icon.backgroundColor.a	UI:87-111; ISWidgetInput.lua:156,500,577
+assume	ISCraftInventoryPanel copies drawListItem into doDrawItem at createChildren, so the wrap must be installed before any panel exists	UI:139-140; ISCraftInventoryPanel.lua:102
+assume	build action identified by a.Type == "ISBuildAction" (a modded subclass wouldn't match)	BA:660
+assume	trap simulation: walls from WallN/W/collide flags and WALL_* props; doors, windows, Hoppable* passable, TallHoppable not	T:44-97; ISBuildIsoEntity.lua:616-620

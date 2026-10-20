@@ -81,8 +81,10 @@ local function isOutsidePart(part)
         and id ~= "GloveBox" and string.sub(id, 1, 4) ~= "Seat"
 end
 
+-- same lookup as vanilla Vehicles.ContainerAccess.TruckBed (server/Vehicles/Vehicles.lua)
 local function trunkDoor(vehicle)
     local part = vehicle:getPartById("TrunkDoor") or vehicle:getPartById("DoorRear")
+        or vehicle:getPartById("TrunkDoorOpened")
     return part and part:getDoor() and part or nil
 end
 
