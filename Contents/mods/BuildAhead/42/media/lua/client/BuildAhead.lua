@@ -87,19 +87,21 @@ end
 -- server's copy replaces the local one when it arrives.
 local localId = 0
 
-function BuildAhead.addSite(name, x, y, z, nSprite)
+-- stack: see BuildAheadSites.find (nil unless the object is stacked on planned ones)
+function BuildAhead.addSite(name, x, y, z, nSprite, stack)
     local data = BuildAheadSites.data()
-    if BuildAheadSites.find(data, name, x, y, z, nSprite) then return nil end
+    if BuildAheadSites.find(data, name, x, y, z, nSprite, stack) then return nil end
     local site
     if isClient() then
-        sendClientCommand(getSpecificPlayer(0), "BuildAhead", "add", { name = name, x = x, y = y, z = z, nSprite = nSprite })
+        sendClientCommand(getSpecificPlayer(0), "BuildAhead", "add",
+            { name = name, x = x, y = y, z = z, nSprite = nSprite, stack = stack })
         localId = localId - 1
-        site = { id = localId, name = name, x = x, y = y, z = z, nSprite = nSprite, by = myName() }
+        site = { id = localId, name = name, x = x, y = y, z = z, nSprite = nSprite, by = myName(), stack = stack }
         table.insert(data.sites, site)
     else
-        site = BuildAheadSites.add(data, name, x, y, z, nSprite, myName())
+        site = BuildAheadSites.add(data, name, x, y, z, nSprite, myName(), stack)
     end
-    log("site added", site.id, name, x, y, z, "nSprite", nSprite)
+    log("site added", site.id, name, x, y, z, "nSprite", nSprite, "stack", stack)
     return site
 end
 
@@ -120,7 +122,7 @@ local function claimSite(site)
     if isClient() then
         -- a site added a moment ago has no server id yet: the server finds it by square
         sendClientCommand(getSpecificPlayer(0), "BuildAhead", "claim", {
-            id = site.id, name = site.name, x = site.x, y = site.y, z = site.z, nSprite = site.nSprite })
+            id = site.id, name = site.name, x = site.x, y = site.y, z = site.z, nSprite = site.nSprite, stack = site.stack })
     end
 end
 
@@ -131,17 +133,22 @@ local function unclaimSite(site)
     site.claimBy, site.claimAt = nil, nil
     if isClient() then
         sendClientCommand(getSpecificPlayer(0), "BuildAhead", "unclaim", {
-            id = site.id, name = site.name, x = site.x, y = site.y, z = site.z, nSprite = site.nSprite })
+            id = site.id, name = site.name, x = site.x, y = site.y, z = site.z, nSprite = site.nSprite, stack = site.stack })
     end
 end
 BuildAhead.unclaim = unclaimSite
 
 -- the planned site of this name on a square (by square: in multiplayer the
--- server's list may have replaced a local id meanwhile)
+-- server's list may have replaced a local id meanwhile); of a stack, the lowest
 local function siteOn(name, x, y, z)
+    local best
     for _, site in ipairs(BuildAhead.getSites()) do
-        if site.name == name and site.x == x and site.y == y and site.z == z then return site end
+        if site.name == name and site.x == x and site.y == y and site.z == z
+            and (not best or (site.stack or 0) < (best.stack or 0)) then
+            best = site
+        end
     end
+    return best
 end
 
 -- the player took over: a movement key or the cancel key (vanilla stops the
@@ -281,12 +288,96 @@ local function siteSquare(site)
     return getCell():getGridSquare(site.x, site.y, site.z)
 end
 
+-- ---------------------------------------------------------------- stacking
+
+-- A stackable object (a wooden crate: its sprite has IsStackable) is built on top
+-- of what stands on its square, as in vanilla, while the stack stays within
+-- STACK_MAX (vanilla's limit in ISMoveableSpriteProps). Several can be planned on
+-- one square: each gets the next `stack` level, its ghost (and the cursor) is
+-- drawn on top of the planned ones below it, and the lowest is built first.
+BuildAhead.STACK_MAX = 96
+local origTableHeight -- ISMoveableSpriteProps.getTotalTableHeight without the cursor's raise
+local cursorRaise     -- { sq, h }: planned height added while the build cursor draws
+-- levels built a moment ago whose site is not removed yet (BuildAhead.CHECK_DELAY_MS):
+-- they stand on the square already and do not count as planned
+local stackBuilt = {}
+
+local function stackKey(name, x, y, z, stack)
+    return name .. "@" .. x .. "," .. y .. "," .. z .. "#" .. tostring(stack)
+end
+
+-- { surface, props } of a stackable entity, false otherwise (kept on the entity)
+local function stackInfo(e)
+    if not e then return false end
+    if e.buildAheadStack ~= nil then return e.buildAheadStack end
+    local ok, info = pcall(function()
+        local sprite = getSprite(e:getFace():getTileInfo(0, 0, 0):getSpriteName())
+        if not sprite:getProperties():has("IsStackable") then return false end
+        return { surface = tonumber(sprite:getProperties():get("Surface")) or 0, props = ISMoveableSpriteProps.new(sprite) }
+    end)
+    e.buildAheadStack = ok and info or false
+    return e.buildAheadStack
+end
+BuildAhead.stackInfo = stackInfo
+
+-- the height of what really stands on the square (vanilla's)
+local function realHeight(si, sq)
+    local ok, h = pcall(origTableHeight or ISMoveableSpriteProps.getTotalTableHeight, si.props, sq)
+    return ok and tonumber(h) or 0
+end
+
+-- the height of the stackable sites planned on a square, below `level` (all when nil)
+local function plannedHeight(playerObj, x, y, z, level)
+    local h = 0
+    for _, site in ipairs(BuildAhead.getSites()) do
+        if site.stack and site.x == x and site.y == y and site.z == z and (not level or site.stack < level)
+            and not stackBuilt[stackKey(site.name, x, y, z, site.stack)] then
+            local si = stackInfo(siteEntity(playerObj, site))
+            if si then h = h + si.surface end
+        end
+    end
+    return h
+end
+
+-- the stack level for a new stackable site on the square
+local function nextLevel(x, y, z)
+    local top = 0
+    for _, site in ipairs(BuildAhead.getSites()) do
+        if site.stack and site.x == x and site.y == y and site.z == z then top = math.max(top, site.stack) end
+    end
+    return top + 1
+end
+
+-- where a stackable site's ghost stands: on the real stack and the planned levels below it
+local function stackBase(playerObj, site, si)
+    local sq = siteSquare(site)
+    return (sq and realHeight(si, sq) or 0) + plannedHeight(playerObj, site.x, site.y, site.z, site.stack)
+end
+BuildAhead.stackBase = stackBase
+
 local function isSiteValid(playerObj, site)
     local e = siteEntity(playerObj, site)
     local sq = siteSquare(site)
     if not e or not sq then return false end
     local ok, valid = pcall(e.isValid, e, sq)
+    if ok and valid and site.stack then
+        -- the planned levels below must fit under it
+        local si = stackInfo(e)
+        if si and stackBase(playerObj, site, si) + si.surface > BuildAhead.STACK_MAX then return false end
+    end
     return ok and valid
+end
+
+-- objects of this name on a square (a stack holds several)
+local function countObjects(name, x, y, z)
+    local sq = getCell():getGridSquare(x, y, z)
+    if not sq then return 0 end
+    local n = 0
+    local objs = sq:getObjects()
+    for i = 0, objs:size() - 1 do
+        if objs:get(i):getName() == name then n = n + 1 end
+    end
+    return n
 end
 
 -- ---------------------------------------------------------------- materials
@@ -498,8 +589,9 @@ end
 -- The stand square for the site (kept, or chosen now): among the squares that
 -- do not wall the player in, the one the player reaches in the fewest steps,
 -- preferring the two sides of a new edge. nil: nothing found (vanilla walks).
--- r: the site's trapCheck result.
-function BuildAhead.standFor(playerObj, site, r)
+-- r: the site's trapCheck result. extra(sq): more steps for a square (the
+-- materials that would still have to be fetched from it), when choosing anew.
+function BuildAhead.standFor(playerObj, site, r, extra)
     if not r or #r.safe == 0 then return nil end
     local k = standKey(site)
     local kept = stands[k]
@@ -522,6 +614,7 @@ function BuildAhead.standFor(playerObj, site, r)
         local d = dist[sk]
         if d then
             local score = d + (r.preferred[sk] and 0 or BuildAhead.STAND_OFF_EDGE)
+            if extra then score = score + extra(sq) end
             if not bestScore or score < bestScore then best, bestScore = sq, score end
         end
     end
@@ -565,10 +658,36 @@ local function isWallLike(e)
     return e.buildAheadWallLike
 end
 
+-- the steps one fetched item counts for when a stand square is chosen: a square
+-- with the materials in its 3x3 wins over a nearer one without them
+BuildAhead.STAND_ITEM_STEPS = 10
+
+-- extra(sq) for standFor: the items still to fetch when the site is built from sq
+local function fetchCost(playerObj, site)
+    local memo = {}
+    return function(sq)
+        local k = sq:getX() .. "," .. sq:getY()
+        if memo[k] == nil then
+            local ok, plan = pcall(BuildAhead.fetchPlan, playerObj, site, nil, sq, true)
+            local n = 0
+            for _, step in ipairs(ok and plan or {}) do n = n + #step.items end
+            memo[k] = n * BuildAhead.STAND_ITEM_STEPS
+        end
+        return memo[k]
+    end
+end
+
+-- vanilla walks to the bottom end of stairs (ISBuildIsoEntity:walkTo): left to it
+local function isStairs(site)
+    return string.sub(site.name, -6) == "Stairs"
+end
+
 -- Where the player builds the site from: sets e.buildAheadStand (the walk then
 -- goes there, see BuildAhead.standFor). false: every square traps (unless the
--- site was ordered by hand).
-local function chooseStand(playerObj, site, e)
+-- site was ordered by hand). Every object but stairs gets one, so that what lies
+-- around it counts as at hand and is not fetched; fetching: choose the square
+-- with the materials around it (the choice is kept for the site).
+local function chooseStand(playerObj, site, e, fetching)
     if playerObj:isBuildCheat() then return true end
     local r = trapCheck(playerObj, site, true)
     if r and r.trap and #r.safe == 0 then
@@ -579,9 +698,11 @@ local function chooseStand(playerObj, site, e)
         log("site", site.id, "would wall the player in from every side:", BuildAheadTrap.squares(r.trapped))
         return false
     end
-    -- walls, doors and frames: a kept stand on the side the player reaches. Other
-    -- objects (stairs, furniture) walk the vanilla way unless a side traps.
+    -- walls, doors and frames: a kept stand on the side the player reaches; furniture:
+    -- a kept square next to it, as vanilla's walk picks; stairs walk the vanilla way
+    -- unless a side traps
     local stand
+    local extra = fetching and fetchCost(playerObj, site) or nil
     if isWallLike(e) or (r and r.trap) then
         -- frames and doors block nothing (they can be passed): stand anywhere around
         local cands = r
@@ -589,7 +710,10 @@ local function chooseStand(playerObj, site, e)
             local ok, res = pcall(BuildAheadTrap.standsAround, e, site.x, site.y, site.z)
             cands = ok and res or nil
         end
-        stand = BuildAhead.standFor(playerObj, site, cands)
+        stand = BuildAhead.standFor(playerObj, site, cands, extra)
+    elseif not isStairs(site) then
+        local ok, cands = pcall(BuildAheadTrap.standsNextTo, e, site.x, site.y, site.z)
+        stand = BuildAhead.standFor(playerObj, site, ok and cands or nil, extra)
     end
     if not stand and r and r.trap then
         -- no path found: the safe square nearest in a straight line, as before
@@ -695,6 +819,7 @@ local skipped = {}  -- site key -> true: tried this chain and could not build
 -- by square, not id: in multiplayer the server's list replaces a local id meanwhile
 local function skipKey(site)
     return site.name .. "@" .. site.x .. "," .. site.y .. "," .. site.z .. ":" .. tostring(site.nSprite)
+        .. "#" .. tostring(site.stack)
 end
 local checks = {}   -- { name, x, y, z, at }: built here, see whether the object is really there
 BuildAhead.CHECK_DELAY_MS = 1000 -- in multiplayer the built object arrives a little after the action ends
@@ -710,7 +835,9 @@ function BuildAhead.pickNext(playerObj, x, y, z)
     local me, hours = myName(), getGameTime():getWorldAgeHours()
     for _, site in ipairs(BuildAhead.getSites()) do
         local d = distSq(site, x, y, z)
-        if d <= range2 and not skipped[skipKey(site)] and (not bestD or d < bestD)
+        -- of a planned stack, the lowest level first
+        if d <= range2 and not skipped[skipKey(site)]
+            and (not bestD or d < bestD or (d == bestD and (site.stack or 0) < (best.stack or 0)))
             and not BuildAheadSites.isClaimedByOther(site, me, hours) then
             if BuildAhead.canBuildSite(playerObj, site) then
                 best, bestD = site, d
@@ -765,7 +892,7 @@ function BuildAhead.buildSite(playerObj, site)
     if not directSites[site.id] and BuildAhead.wouldTrap(playerObj, site, true) then return false end
     -- the square it is built from: what lies around it is at hand there, not fetched
     local e = siteEntity(playerObj, site)
-    if e then pcall(chooseStand, playerObj, site, e) end
+    if e then pcall(chooseStand, playerObj, site, e, true) end
     local ok, plan = pcall(BuildAhead.fetchPlan, playerObj, site)
     if not ok then log("fetch plan error", plan); plan = nil end
     if plan and #plan == 0 then return BuildAhead.tryBuildSite(playerObj, site) end
@@ -836,9 +963,11 @@ end
 local function onCursorClick(cursor, x, y, z)
     local playerObj = cursor.character
     local name = cursor.objectInfo:getName()
-    if sameAsCurrentBuild(playerObj, name, x, y, z) then return end
-    local site = BuildAhead.addSite(name, x, y, z, cursor.nSprite)
-        or BuildAheadSites.find(BuildAheadSites.data(), name, x, y, z, cursor.nSprite)
+    -- a stackable object goes on top of the planned ones: another click is another level
+    local stack = stackInfo(cursor) and nextLevel(x, y, z) or nil
+    if not stack and sameAsCurrentBuild(playerObj, name, x, y, z) then return end
+    local site = BuildAhead.addSite(name, x, y, z, cursor.nSprite, stack)
+        or BuildAheadSites.find(BuildAheadSites.data(), name, x, y, z, cursor.nSprite, stack)
     local reason = site and BuildAhead.cannotBuildReason(playerObj, site)
     -- an upgrade planned on a planned stage waits for that stage: nothing to say
     if reason == getText("IGUI_BuildAhead_Blocked") and BuildAhead.onPlannedStage(cursor, getCell():getGridSquare(x, y, z)) then
@@ -927,7 +1056,39 @@ local function hookCursor()
             local ok, yes = pcall(onPlannedStage, self, square)
             if ok and yes then return true end
         end
+        -- on top of planned levels: the whole stack must stay within the limit
+        local si = valid and planning and square and stackInfo(self)
+        if si then
+            local planned = plannedHeight(self.character, square:getX(), square:getY(), square:getZ())
+            if planned > 0 and realHeight(si, square) + planned + si.surface > BuildAhead.STACK_MAX then
+                return false
+            end
+        end
         return valid
+    end
+
+    -- the cursor of a stackable object is drawn on top of the levels planned on its
+    -- square (vanilla raises it by the real stack's height only)
+    origTableHeight = ISMoveableSpriteProps.getTotalTableHeight
+    function ISMoveableSpriteProps:getTotalTableHeight(square, ...)
+        local h = origTableHeight(self, square, ...)
+        local r = cursorRaise
+        if r and square == r.sq then h = h + r.h end
+        return h
+    end
+    local origRender = ISBuildIsoEntity.render
+    function ISBuildIsoEntity:render(x, y, z, square, ...)
+        if square and plansSites(self) and stackInfo(self) then
+            local h = plannedHeight(self.character, square:getX(), square:getY(), square:getZ())
+            if h > 0 then
+                cursorRaise = { sq = square, h = h }
+                local ok, err = pcall(origRender, self, x, y, z, square, ...)
+                cursorRaise = nil
+                if not ok then log("cursor render error", err) end
+                return
+            end
+        end
+        return origRender(self, x, y, z, square, ...)
     end
 
     local origTryBuild = ISBuildIsoEntity.tryBuild
@@ -992,22 +1153,23 @@ local function hookBuildAction()
 
     local origPerform = ISBuildAction.perform
     function ISBuildAction:perform(...)
+        local name = self.item and self.item.objectInfo and self.item.objectInfo:getName()
+        local before = name and countObjects(name, self.x, self.y, self.z)
         origPerform(self, ...)
         local playerObj = self.character
         if not playerObj or not playerObj:isLocalPlayer() then return end
-        local name = self.item and self.item.objectInfo and self.item.objectInfo:getName()
         if name then
             -- a site built here (by the scheduler or by hand): skip it now, and remove it
             -- once the object is there; if it stays buildable the build failed
-            for _, site in ipairs(BuildAhead.getSites()) do
-                if site.name == name and site.x == self.x and site.y == self.y and site.z == self.z then
-                    skipped[skipKey(site)] = true
-                    directSites[site.id] = nil
-                    break
-                end
+            local site = siteOn(name, self.x, self.y, self.z)
+            if site then
+                skipped[skipKey(site)] = true
+                directSites[site.id] = nil
+                if site.stack then stackBuilt[stackKey(name, self.x, self.y, self.z, site.stack)] = true end
             end
-            table.insert(checks, { name = name, x = self.x, y = self.y, z = self.z,
-                at = getTimestampMs() + BuildAhead.CHECK_DELAY_MS, refresh = self.item.buildAheadSite })
+            -- a stack stays buildable after a level is built: count the objects instead
+            table.insert(checks, { name = name, x = self.x, y = self.y, z = self.z, stack = site and site.stack,
+                before = before, at = getTimestampMs() + BuildAhead.CHECK_DELAY_MS, refresh = self.item.buildAheadSite })
         end
         if self.item and self.item.buildAheadSite then refreshBuildPanel(playerObj) end
         -- the new object changes what the other sites would close off
@@ -1028,9 +1190,16 @@ local function runChecks()
             table.remove(checks, i)
             -- by square, not id: in multiplayer the server's list may have replaced a local id meanwhile
             for _, site in ipairs(playerObj and BuildAhead.getSites() or {}) do
-                if site.name == c.name and site.x == c.x and site.y == c.y and site.z == c.z then
+                if site.name == c.name and site.x == c.x and site.y == c.y and site.z == c.z and site.stack == c.stack then
                     cache[site.id] = nil
-                    if not isSiteValid(playerObj, site) then BuildAhead.removeSite(site.id) end
+                    local done
+                    if c.stack then
+                        stackBuilt[stackKey(c.name, c.x, c.y, c.z, c.stack)] = nil
+                        done = countObjects(c.name, c.x, c.y, c.z) > (c.before or 0)
+                    else
+                        done = not isSiteValid(playerObj, site)
+                    end
+                    if done then BuildAhead.removeSite(site.id) end
                     break
                 end
             end
@@ -1063,13 +1232,17 @@ local function renderGhost(playerObj, site, now)
         or c.state == "missing" and BuildAhead.COLOR_MISSING
         or c.state == "trap" and BuildAhead.COLOR_TRAP or BuildAhead.COLOR_BLOCKED
     local a = 0.4 + 0.12 * math.sin(now / 350)
+    local si = site.stack and stackInfo(e)
+    local offY = si and stackBase(playerObj, site, si) * Core.getTileScale() or nil
     for zz = 0, face:getzLayers() - 1 do
         for xx = 0, face:getWidth() - 1 do
             for yy = 0, face:getHeight() - 1 do
                 local tileInfo = face:getTileInfo(xx, yy, zz)
                 local name = tileInfo and tileInfo:getSpriteName()
                 local sprite = name and getSprite(name)
-                if sprite then
+                if sprite and offY then
+                    sprite:RenderGhostTileColor(site.x + xx, site.y + yy, site.z + zz, 0, offY, color[1], color[2], color[3], a)
+                elseif sprite then
                     sprite:RenderGhostTileColor(site.x + xx, site.y + yy, site.z + zz, color[1], color[2], color[3], a)
                 end
             end

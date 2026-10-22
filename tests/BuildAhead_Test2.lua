@@ -17,6 +17,10 @@
 --      stays planned and unclaimed, nothing is lost; "Build planned" or a click resumes
 --   T5 many sites: 64 planned sites, frame time and the cost of the state checks; the chain
 --      still builds the nearest site first
+--   T7 furniture stand: materials lying two squares from a crate are used where they lie (the
+--      crate is built from the square next to it whose 3x3 holds them), nothing is fetched
+--   T8 stacked crates: three clicks on one square plan three levels, the third ghost sits on
+--      two, a fourth is refused; the chain builds all three on that square and stops
 --   T6 persistence, part 1: sites and a ban are left for the reload run
 --      (BuildAheadTest2.reloadStart / reloadPoll, a second `pzt run KEEP_SAVE=1`)
 -- Results: "[BuildAheadTest2]" lines; failures also as "[PZTest] FAIL".
@@ -895,6 +899,130 @@ local function scenarioMany()
     clearBag()
 end
 
+-- ---------------------------------------------------------------- T7 furniture stand
+
+local CRATE = "Wood_Crate_Lvl2"
+
+local function floorCount(x, y, z, fullType)
+    local s = sq(x, y, z)
+    local wos = s and s:getWorldObjects()
+    local n = 0
+    for i = 0, (wos and wos:size() or 0) - 1 do
+        local it = wos:get(i):getItem()
+        if it and it:getFullType() == fullType then n = n + 1 end
+    end
+    return n
+end
+
+local function countAt(name, x, y, z)
+    local n = 0
+    for part in string.gmatch(objectsAt(x, y, z), "[^,]+") do
+        if part == name then n = n + 1 end
+    end
+    return n
+end
+
+-- the materials lie two squares east of the crate, the player comes from the west:
+-- the crate is built from a square next to it whose 3x3 holds them, and nothing is fetched
+local function scenarioFurnitureStand()
+    local p = player()
+    clearSites()
+    clearBag()
+    local info = entityInfo(CRATE)
+    if not check("T7 recipe " .. CRATE, info ~= nil) then return end
+    local A = findArea(9, 5, "T7")
+    local S = { x = A.x + 4, y = A.y + 2, z = 0 }
+    local M = { x = S.x + 2, y = S.y + 1, z = 0 }
+    teleport(A.x, S.y, 0)
+    wait(60)
+    p:getInventory():AddItem("Base.BallPeenHammerForged")
+    local need = cost(info)
+    local msq = sq(M.x, M.y, M.z)
+    for t, n in pairs(need) do
+        for _ = 1, n do msq:AddWorldInventoryItem(t, 0.5, 0.5, 0) end
+    end
+    BuildAheadFetch.scanCache = nil
+    log("T7 materials at", M.x, M.y, costText(need), "crate at", S.x, S.y, "player at", playerSq())
+    local takes, rehandled = BuildAheadFetch.stats.takes, BuildAheadFetch.stats.rehandled
+    R.performed = {}
+    local site = plan(info, 1, S)
+    check("T7 crate planned", site ~= nil)
+    waitIdle(60 * 120, "T7 chain")
+    local _, b = performedIndex(CRATE, S.x, S.y, S.z)
+    check("T7 crate built", hasObject(S.x, S.y, S.z, CRATE), objectsAt(S.x, S.y, S.z))
+    check("T7 built next to the crate, with the materials in its 3x3",
+        b and math.max(math.abs(b.px - M.x), math.abs(b.py - M.y)) <= 1
+            and math.max(math.abs(b.px - S.x), math.abs(b.py - S.y)) == 1,
+        b and (b.px .. "," .. b.py) or "not built")
+    check("T7 nothing fetched", BuildAheadFetch.stats.takes == takes
+        and BuildAheadFetch.stats.rehandled == rehandled, "takes " .. (BuildAheadFetch.stats.takes - takes))
+    local left = {}
+    for t in pairs(need) do
+        local n = floorCount(M.x, M.y, M.z, t) + invCount(t)
+        if n > 0 then left[#left + 1] = t .. " x" .. n end
+    end
+    check("T7 floor materials used where they lie", #left == 0, table.concat(left, " "))
+    check("T7 site removed", #BuildAhead.getSites() == 0, "sites " .. #BuildAhead.getSites())
+end
+
+-- ---------------------------------------------------------------- T8 stacked crates
+
+-- three clicks on one square plan three levels of a crate stack; the chain builds them
+-- on that square, removes the sites and builds no more
+local function scenarioStack()
+    local p = player()
+    clearSites()
+    clearBag()
+    local info = entityInfo(CRATE)
+    if not check("T8 recipe " .. CRATE, info ~= nil) then return end
+    local A = findArea(6, 6, "T8")
+    local S = { x = A.x + 3, y = A.y + 3, z = 0 }
+    teleport(A.x + 1, S.y, 0)
+    wait(60)
+    local inv = p:getInventory()
+    inv:AddItem("Base.BallPeenHammerForged")
+    local need = cost(info)
+    for t, n in pairs(need) do addTo(inv, t, n * 3) end
+    R.performed = {}
+    -- (a build without stacking support still runs the clicks and the chain, as a crate of 32)
+    local si = BuildAhead.stackInfo and BuildAhead.stackInfo(makeCursor(info, 1))
+    if not check("T8 crate is stackable", si and si.surface > 0, si and tostring(si.surface)) then
+        si = { surface = 32 }
+    end
+    local levels = math.floor((BuildAhead.STACK_MAX or 96) / si.surface)
+    check("T8 three levels fit", levels >= 3, "surface " .. si.surface .. " levels " .. levels)
+    for _ = 1, 3 do makeCursor(info, 1):tryBuild(S.x, S.y, S.z) end
+    local stack = {}
+    for _, s in ipairs(BuildAhead.getSites()) do
+        if s.x == S.x and s.y == S.y and s.z == S.z then stack[#stack + 1] = s end
+    end
+    table.sort(stack, function(a, b) return (a.stack or 0) < (b.stack or 0) end)
+    local levelsText = {}
+    for _, s in ipairs(stack) do levelsText[#levelsText + 1] = tostring(s.stack) end
+    check("T8 three levels planned on one square", #stack == 3 and stack[1].stack == 1 and stack[3].stack == 3,
+        table.concat(levelsText, ","))
+    if stack[3] and BuildAhead.stackBase then
+        local base = BuildAhead.stackBase(p, stack[3], si)
+        check("T8 third ghost drawn on two levels", base == 2 * si.surface, "base " .. tostring(base))
+    end
+    if levels == 3 then
+        check("T8 a fourth planned level is refused by the cursor", not makeCursor(info, 1):isValid(sq(S.x, S.y, S.z)))
+    end
+    waitIdle(60 * 300, "T8 chain")
+    wait(120)
+    for i, b in ipairs(R.performed) do log("T8 built", i, b.name, b.x, b.y, b.z, "player at", b.px, b.py) end
+    check("T8 three crates on the square", countAt(CRATE, S.x, S.y, S.z) == 3, objectsAt(S.x, S.y, S.z))
+    local behind = countAt(CRATE, S.x - 1, S.y - 1, 0) + countAt(CRATE, S.x - 2, S.y - 2, 0)
+    check("T8 nothing built on the squares behind", behind == 0, "crates " .. behind)
+    local others = 0
+    for _, b in ipairs(R.performed) do
+        if not (b.x == S.x and b.y == S.y) then others = others + 1 end
+    end
+    check("T8 three builds, all on the square", #R.performed == 3 and others == 0, "builds " .. #R.performed)
+    check("T8 all sites removed", #BuildAhead.getSites() == 0, "sites " .. #BuildAhead.getSites())
+    check("T8 a full stack is refused by the cursor", not makeCursor(info, 1):isValid(sq(S.x, S.y, S.z)))
+end
+
 -- ---------------------------------------------------------------- T6 persistence, part 1
 
 local PERSIST_FILE = "buildahead_persist.txt"
@@ -933,6 +1061,8 @@ local SCENARIOS = {
     { "T3 vehicles and corpses", scenarioSources },
     { "T4 interruption", scenarioInterrupt },
     { "T5 many sites", scenarioMany },
+    { "T7 furniture stand", scenarioFurnitureStand },
+    { "T8 stacked crates", scenarioStack },
     { "T6 persistence (save)", scenarioPersistSave },
 }
 
@@ -1038,7 +1168,8 @@ end
 
 BuildAheadTest2 = {}
 
-function BuildAheadTest2.start()
+-- only: "T7,T8" runs just the scenarios whose names start with these
+function BuildAheadTest2.start(only)
     if R.phase ~= "idle" then
         PZTest.fail("BuildAheadTest2 already ran in this game; pzt stop, then run again")
         return
@@ -1049,6 +1180,14 @@ function BuildAheadTest2.start()
     R.cheat = ISBuildMenu.cheat
     ISBuildMenu.cheat = false
     R.list = SCENARIOS
+    if only then
+        R.list = {}
+        for _, sc in ipairs(SCENARIOS) do
+            for pre in string.gmatch(only, "[^,]+") do
+                if string.sub(sc[1], 1, #pre) == pre then R.list[#R.list + 1] = sc end
+            end
+        end
+    end
     log("start")
     startScenario(1)
 end

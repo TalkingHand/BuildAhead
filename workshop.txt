@@ -12,6 +12,7 @@ description=[*][b]Fetches materials[/b]: what a site still lacks is picked up fr
 description=[*][b]Material bans[/b]: click the small X on a material in the build window to never use that item type (e.g. keep your planks, use logs). Per player.
 description=[*][b]Never walls you in[/b]: the chain builds a closing wall from the outside, or leaves it planned. If you want to lock yourself in, right-click the ghost and choose "Build planned".
 description=[*][b]Upgrades ahead[/b]: plan a wall on a planned wall frame, a door in a planned door frame. They are built in order.
+description=[*][b]Stacked crates[/b]: click the same square again to plan the next wooden crate on top of the planned ones, as vanilla stacks them (up to three). The cursor and the ghosts show the stack, and the lowest is built first.
 description=[*][b]Ghost colors[/b]: blue = can be built, yellow = materials or skill missing, red = blocked, orange = would wall you in.
 description=[*][b]Right-click a ghost[/b]: "Build planned" starts from that site (greyed out with the reason when it cannot be built), "Cancel" removes it. Anyone can cancel any site.
 description=[*]Building starts only when you click, when a build finishes, or from "Build planned". Nothing starts on its own while you are idle. Moving stops the chain; the sites stay.
@@ -25,7 +26,7 @@ description=[h2]Compatibility[/h2]
 description=Build 42. Works with the build window's buildings (B42 build entities). No vanilla files replaced. Safe to add to existing saves. Mods that also change build placement or action queues may conflict.
 description=
 description=[h2]한국어[/h2]
-description=건설 커서로 클릭한 자리가 모두 [b]건설 예정지[/b](파란 고스트)가 되고, 캐릭터가 가까운 순서로 차례대로 지어요. 짓는 중에도 계속 클릭해서 예약할 수 있고, 재료가 없어도 예정지를 찍어둘 수 있어요. 부족한 재료는 20칸 안의 바닥, 상자, 시체, 차량 트렁크에서 가져와요(잠긴 곳, 남의 안전구역, 갈 수 없는 곳 제외). 필요한 만큼만, 인벤토리와 착용한 가방이 담을 수 있는 최대치까지 한 번에 들고 가요(가는 동안 무게 초과가 될 수 있어요). 예정지마다 걸어서 닿는 한쪽에서 짓고, 남은 왕복분은 그 자리에 내려놓으며, 예정지 바로 옆에 있는 재료는 그 자리에서 써요. 건설 창 재료 칸의 X 버튼으로 특정 재료를 쓰지 않게 할 수 있어요. 자동으로 지을 때는 캐릭터가 벽 안에 갇히지 않게 바깥에서 지어요(일부러 갇히려면 고스트 우클릭 "예정지 건설"). 고스트 색: 파랑 = 지을 수 있음, 노랑 = 재료/스킬 부족, 빨강 = 막힘, 주황 = 갇힐 수 있음. 멀티에서는 서버가 예정지를 공유하며, 서버와 모든 클라이언트에 모드가 필요해요.
+description=건설 커서로 클릭한 자리가 모두 [b]건설 예정지[/b](파란 고스트)가 되고, 캐릭터가 가까운 순서로 차례대로 지어요. 짓는 중에도 계속 클릭해서 예약할 수 있고, 재료가 없어도 예정지를 찍어둘 수 있어요. 부족한 재료는 20칸 안의 바닥, 상자, 시체, 차량 트렁크에서 가져와요(잠긴 곳, 남의 안전구역, 갈 수 없는 곳 제외). 필요한 만큼만, 인벤토리와 착용한 가방이 담을 수 있는 최대치까지 한 번에 들고 가요(가는 동안 무게 초과가 될 수 있어요). 예정지마다 걸어서 닿는 한쪽에서 짓고, 남은 왕복분은 그 자리에 내려놓으며, 예정지 바로 옆에 있는 재료는 그 자리에서 써요. 나무 상자는 같은 칸을 다시 클릭하면 위에 쌓을 상자가 예정되고(바닐라처럼 3단까지), 아래부터 지어요. 건설 창 재료 칸의 X 버튼으로 특정 재료를 쓰지 않게 할 수 있어요. 자동으로 지을 때는 캐릭터가 벽 안에 갇히지 않게 바깥에서 지어요(일부러 갇히려면 고스트 우클릭 "예정지 건설"). 고스트 색: 파랑 = 지을 수 있음, 노랑 = 재료/스킬 부족, 빨강 = 막힘, 주황 = 갇힐 수 있음. 멀티에서는 서버가 예정지를 공유하며, 서버와 모든 클라이언트에 모드가 필요해요.
 description=
 description=Source: https://github.com/TalkingHand/BuildAhead
 tags=Build 42;Building;Interface

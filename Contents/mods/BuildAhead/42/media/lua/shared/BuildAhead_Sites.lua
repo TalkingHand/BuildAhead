@@ -15,9 +15,11 @@ function BuildAheadSites.data()
     return data
 end
 
-function BuildAheadSites.find(data, name, x, y, z, nSprite)
+-- stack: the level of a stackable object (a crate) planned on a square that
+-- already has planned ones (nil for everything else)
+function BuildAheadSites.find(data, name, x, y, z, nSprite, stack)
     for _, s in ipairs(data.sites) do
-        if s.x == x and s.y == y and s.z == z and s.name == name and s.nSprite == nSprite then
+        if s.x == x and s.y == y and s.z == z and s.name == name and s.nSprite == nSprite and s.stack == stack then
             return s
         end
     end
@@ -30,13 +32,14 @@ function BuildAheadSites.get(data, id)
 end
 
 -- returns the new site, or nil when the same site is already planned
-function BuildAheadSites.add(data, name, x, y, z, nSprite, by)
+function BuildAheadSites.add(data, name, x, y, z, nSprite, by, stack)
     if type(name) ~= "string" or type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" then
         return nil
     end
     nSprite = tonumber(nSprite) or 1
-    if BuildAheadSites.find(data, name, x, y, z, nSprite) then return nil end
-    local site = { id = data.nextId, name = name, x = x, y = y, z = z, nSprite = nSprite, by = by }
+    stack = tonumber(stack)
+    if BuildAheadSites.find(data, name, x, y, z, nSprite, stack) then return nil end
+    local site = { id = data.nextId, name = name, x = x, y = y, z = z, nSprite = nSprite, by = by, stack = stack }
     data.nextId = data.nextId + 1
     table.insert(data.sites, site)
     return site

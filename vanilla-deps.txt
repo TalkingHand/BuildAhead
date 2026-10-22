@@ -23,7 +23,9 @@
 ## Wrapped vanilla functions (all installed on Events.OnGameStart unless noted)
 lua-wrap	ISBuildIsoEntity:isValid	BA:909-931; server/BuildingObjects/ISBuildIsoEntity.lua:435. Original called (blockBuild forced false while planning, pcall)
 lua-wrap	ISBuildIsoEntity:tryBuild	BA:933-945; ISBuildIsoEntity.lua:858. Original NOT called for planning cursors (stores a site), called for scheduler entities
-lua-wrap	ISBuildIsoEntity:walkTo	BA:1216-1221; ISBuildIsoEntity.lua:9. Original skipped when self.buildAheadStand is set (queues ISPathFindAction instead)
+lua-wrap	ISBuildIsoEntity:walkTo	BA:1216-1221; ISBuildIsoEntity.lua:9. Original skipped when self.buildAheadStand is set (queues ISPathFindAction instead); every scheduler build but stairs has one
+lua-wrap	ISBuildIsoEntity:render	BA:1080-1093; ISBuildIsoEntity.lua:70. Original called; for a stackable cursor over planned levels, inside the getTotalTableHeight raise below
+lua-wrap	ISMoveableSpriteProps:getTotalTableHeight	BA:1072-1078; shared/Moveables/ISMoveableSpriteProps.lua:1555. Original called; adds the planned levels' height only while the build cursor renders
 lua-wrap	ISBuildIsoEntity:create	SV:78-92; ISBuildIsoEntity.lua:501. Original always called, after re-filling inputs without banned types. Dedicated server only (isServer); file load + OnGameBoot + OnServerStarted
 lua-wrap	ISBuildAction:start	BA:953-973; client/BuildingObjects/TimedActions/ISBuildAction.lua:127. Original called after container/input refresh + stopCraftAction/startCraftAction(self)
 lua-wrap	ISBuildAction:stop / forceStop	BA:977-991; ISBuildAction.lua:156,184. Original called (unclaims site)
@@ -42,6 +44,7 @@ lua-wrap	ISCraftInventoryPanel:createChildren	UI:162-181; ISCraftInventoryPanel.
 
 ## Vanilla Lua called
 lua-call	ISBuildIsoEntity:new(char, info, nSprite, containers)	BA:251; ISBuildIsoEntity.lua:875 (without a logic it makes its own BuildLogic.new + setContainers + setRecipe)
+lua-call	ISMoveableSpriteProps.new(sprite) / getTotalTableHeight(sq)	BA:316,330; ISMoveableSpriteProps.lua:71,1555
 lua-call	ISBuildIsoEntity.GetAllBuildableEntities	BA:79; ISBuildIsoEntity.lua:950
 lua-call	ISBuildIsoEntity.predicateMaterial	BA:201, F:224,260, IN:46; ISBuildIsoEntity.lua:1107
 lua-call	ISBuildIsoEntity:getSprite / getFace	BA:264,288; ISBuildIsoEntity.lua:775, server/BuildingObjects/ISBuildingObject.lua:482
@@ -85,9 +88,9 @@ java-call	BuildLogic: setContainers, setRecipe, getRecipe, getRecipeData, is/set
 java-call	CraftRecipeData: getRecipe, getDataForInputScript; InputScriptData: getAppliedItemsCount, getAppliedItem, isInputItemsSatisfied	BA:234-240, F:243-248, IN:32-54
 java-call	ItemContainer: getAllTypeEvalRecurse, isEmpty, isLockedToCharacter, getItems, getItemById, getEffectiveCapacity, getContentsWeight, getContainingItem	BA:201, F:73-446
 java-call	InventoryItem / DrainableComboItem / InventoryContainer: getFullType, getID, getContainer, getUnequippedWeight, isEquipped, getCurrentUses, getInventory, getWeightReduction	F:223-636
-java-call	IsoGridSquare: getWorldObjects, getObjects, getDeadBodys, getVehicleContainer, canReachTo, TreatAsSolidFloor, isBlockedTo, getTotalWeightOfItemsOnFloor, isFree, HasStairs, isDoorTo, isWindowTo, isHoppableTo, getWindowFrameTo	F:99-638, T:140-375
+java-call	IsoGridSquare: getWorldObjects, getObjects, getDeadBodys, getVehicleContainer, canReachTo, TreatAsSolidFloor, isBlockedTo, getTotalWeightOfItemsOnFloor, isFree, HasStairs, isDoorTo, isWindowTo, isHoppableTo, getWindowFrameTo, isWallTo	F:99-638, T:140-375 (isWallTo/isWindowTo pcall'd, T:342)
 java-call	BaseVehicle / VehiclePart / VehicleDoor: getId, getDriver, isTrunkLocked, getPart*, canAccessContainer, getItemContainer, getArea, getDoor, isLocked, isOpen	F:79-755
-java-call	IsoSprite: getProperties, getType, RenderGhostTileColor (7 args); PropertyContainer: has, getFlagsList; FaceInfo/TileInfo	BA:543-1127, T:36-106
+java-call	IsoSprite: getProperties, getType, RenderGhostTileColor (7 args; 9 with x/y offset for stacks, BA:1243); PropertyContainer: has, get("Surface"), getFlagsList; FaceInfo/TileInfo; Core.getTileScale; IsoObject:getName (built object = entity name, BA:372)	BA:543-1127, T:36-106
 java-call	SafeHouse.isSafehouseAllowLoot(sq, player)	F:67 (same as client/ISUI/ISInventoryPage.lua:1685)
 java-call	globals: sendClientCommand, sendServerCommand, getSprite, getTimestampMs, ZombRand, getScriptManager, getTextManager, getSoundManager
 data	enums: ResourceType.Item; IsoObjectType.doorW/N, doorFrW/N; IsoPropertyType WALL_*, WINDOW_*, DOOR_WALL_*; IsoFlagType doorN/W, Wall*, DoorWall*, Window*, window*, Hoppable*, collide*, solid, solidtrans	BA:302-873, T:47-85
@@ -152,4 +155,7 @@ assume	ISWidgetBuildControl:prerender resets buttonCraft.enable every frame	BA:1
 assume	ISWidgetInput:updateValues runs every frame and resets primary.icon.backgroundColor.a	UI:87-111; ISWidgetInput.lua:156,500,577
 assume	ISCraftInventoryPanel copies drawListItem into doDrawItem at createChildren, so the wrap must be installed before any panel exists	UI:139-140; ISCraftInventoryPanel.lua:102
 assume	build action identified by a.Type == "ISBuildAction" (a modded subclass wouldn't match)	BA:660
+assume	vanilla walks to furniture with walkAdjSquares: next to a tile, diagonals allowed, never on it; the mod picks that square itself (T.standsNextTo) and the build action accepts it	BA:690-730, T:348; ISBuildIsoEntity.lua:26-29, luautils.lua:398 (diagonal stand tested in T7)
+assume	stackable = first tile sprite has IsStackable; stacked on the same square, cursor/ghost raised by getTotalTableHeight, limit total + Surface <= 96; create sets RenderYOffset	BA:290-370; ISBuildIsoEntity.lua:95-97,220,336-339,672-676, ISMoveableSpriteProps.lua:1772-1774
+assume	a stack square stays valid after a level is built, so a stacked site counts as built when the objects of its name on the square went up	BA:372, runChecks
 assume	trap simulation: walls from WallN/W/collide flags and WALL_* props; doors, windows, Hoppable* passable, TallHoppable not	T:44-97; ISBuildIsoEntity.lua:616-620

@@ -24,21 +24,21 @@ local function onClientCommand(module, command, player, args)
     local who = player and player:getUsername() or "?"
     local changed = false
     if command == "add" then
-        local site = BuildAheadSites.add(data, args.name, args.x, args.y, args.z, args.nSprite, who)
+        local site = BuildAheadSites.add(data, args.name, args.x, args.y, args.z, args.nSprite, who, args.stack)
         changed = site ~= nil
-        if site then log("site added", site.id, site.name, site.x, site.y, site.z, "by", who) end
+        if site then log("site added", site.id, site.name, site.x, site.y, site.z, "stack", site.stack, "by", who) end
     elseif command == "remove" then
         changed = BuildAheadSites.remove(data, args.id)
         if changed then log("site removed", args.id, "by", who) end
     elseif command == "claim" then
         -- a site the client added a moment ago has only a local id: find it by square
         local site = (type(args.id) == "number" and args.id > 0) and BuildAheadSites.get(data, args.id)
-            or BuildAheadSites.find(data, args.name, args.x, args.y, args.z, tonumber(args.nSprite) or 1)
+            or BuildAheadSites.find(data, args.name, args.x, args.y, args.z, tonumber(args.nSprite) or 1, tonumber(args.stack))
         changed = site ~= nil and BuildAheadSites.claim(data, site.id, who, getGameTime():getWorldAgeHours())
     elseif command == "unclaim" then
         -- the player stopped building it: only their own claim is released
         local site = (type(args.id) == "number" and args.id > 0) and BuildAheadSites.get(data, args.id)
-            or BuildAheadSites.find(data, args.name, args.x, args.y, args.z, tonumber(args.nSprite) or 1)
+            or BuildAheadSites.find(data, args.name, args.x, args.y, args.z, tonumber(args.nSprite) or 1, tonumber(args.stack))
         if site and site.claimBy == who then
             site.claimBy, site.claimAt = nil, nil
             changed = true

@@ -337,6 +337,52 @@ function T.standsAround(e, x, y, z)
     return result
 end
 
+-- a wall or window between two neighbouring squares (not a solid object on either)
+local function walled(a, b)
+    return call(a, "isWallTo", b) == true or call(a, "isWindowTo", b) == true
+end
+
+-- Squares to build a piece of furniture from, as vanilla's walk does
+-- (walkAdjSquares): next to one of its tiles, diagonals included, never on them,
+-- with no wall in between. Same shape as T.evaluate's result.
+function T.standsNextTo(e, x, y, z)
+    local b = T.blockage(e, x, y)
+    local cell = getCell()
+    local result = { trap = false, safe = {}, trapped = {}, preferred = {} }
+    local tiles = #b.tiles > 0 and b.tiles or { { x = x, y = y } }
+    local occupied = {}
+    for _, t in ipairs(tiles) do occupied[key(t.x, t.y)] = true end
+    local seen = {}
+    for _, t in ipairs(tiles) do
+        local tsq = cell:getGridSquare(t.x, t.y, z)
+        for dx = -1, 1 do
+            for dy = -1, 1 do
+                local sx, sy = t.x + dx, t.y + dy
+                local k = key(sx, sy)
+                if not occupied[k] and not seen[k] then
+                    local sq = cell:getGridSquare(sx, sy, z)
+                    local open = false
+                    if sq and tsq and canStand(sq, b) then
+                        if dx == 0 or dy == 0 then
+                            open = not walled(sq, tsq)
+                        else
+                            -- diagonal: open through one of the two squares beside both
+                            local ax, ay = cell:getGridSquare(t.x + dx, t.y, z), cell:getGridSquare(t.x, t.y + dy, z)
+                            open = (ax ~= nil and not walled(sq, ax) and not walled(ax, tsq))
+                                or (ay ~= nil and not walled(sq, ay) and not walled(ay, tsq))
+                        end
+                    end
+                    if open then
+                        seen[k] = true
+                        result.safe[#result.safe + 1] = sq
+                    end
+                end
+            end
+        end
+    end
+    return result
+end
+
 -- Steps from `start` to each of `squares` on its level, walking around walls
 -- (a door counts as open: the player opens it on the way). Returns
 -- {key = steps} for the squares reached within `radius` of start.
