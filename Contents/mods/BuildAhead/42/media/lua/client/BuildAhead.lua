@@ -138,14 +138,29 @@ local function unclaimSite(site)
 end
 BuildAhead.unclaim = unclaimSite
 
+-- levels built a moment ago whose site is not removed yet (BuildAhead.CHECK_DELAY_MS):
+-- they stand on the square already and do not count as planned
+local stackBuilt = {}
+
+local function stackKey(name, x, y, z, stack)
+    return name .. "@" .. x .. "," .. y .. "," .. z .. "#" .. tostring(stack)
+end
+
 -- the planned site of this name on a square (by square: in multiplayer the
--- server's list may have replaced a local id meanwhile); of a stack, the lowest
-local function siteOn(name, x, y, z)
+-- server's list may have replaced a local id meanwhile). Of a stack: the given
+-- level (the one a scheduler build was started for), else the lowest level not
+-- built a moment ago. A level just built stays listed for CHECK_DELAY_MS, so the
+-- lowest listed one is not always the one being built.
+local function siteOn(name, x, y, z, level)
     local best
     for _, site in ipairs(BuildAhead.getSites()) do
-        if site.name == name and site.x == x and site.y == y and site.z == z
-            and (not best or (site.stack or 0) < (best.stack or 0)) then
-            best = site
+        if site.name == name and site.x == x and site.y == y and site.z == z then
+            if level then
+                if site.stack == level then return site end
+            elseif not (site.stack and stackBuilt[stackKey(name, x, y, z, site.stack)])
+                and (not best or (site.stack or 0) < (best.stack or 0)) then
+                best = site
+            end
         end
     end
     return best
@@ -298,13 +313,6 @@ end
 BuildAhead.STACK_MAX = 96
 local origTableHeight -- ISMoveableSpriteProps.getTotalTableHeight without the cursor's raise
 local cursorRaise     -- { sq, h }: planned height added while the build cursor draws
--- levels built a moment ago whose site is not removed yet (BuildAhead.CHECK_DELAY_MS):
--- they stand on the square already and do not count as planned
-local stackBuilt = {}
-
-local function stackKey(name, x, y, z, stack)
-    return name .. "@" .. x .. "," .. y .. "," .. z .. "#" .. tostring(stack)
-end
 
 -- { surface, props } of a stackable entity, false otherwise (kept on the entity)
 local function stackInfo(e)
@@ -847,6 +855,65 @@ function BuildAhead.pickNext(playerObj, x, y, z)
     return best
 end
 
+BuildAhead.BATCH_MAX = 8 -- sites after the first whose materials a fetch trip may bring along
+
+-- The sites the chain is expected to build after `site`, in order: from each, the
+-- nearest planned site in range (as pickNext, from where the last build stands)
+-- that is valid now, on the same level, within the player's skills, not walling
+-- the player in and not claimed by another player. Materials are not asked for:
+-- they are what a trip would bring along. An upgrade on a planned stage is not
+-- valid yet and is left out; the levels of a planned stack are in.
+function BuildAhead.expectedNext(playerObj, site)
+    local out, used = {}, { [site.id] = true }
+    local range2 = BuildAhead.RANGE * BuildAhead.RANGE
+    local me, hours = myName(), getGameTime():getWorldAgeHours()
+    local cur = site
+    while #out < BuildAhead.BATCH_MAX do
+        local best, bestD
+        for _, s in ipairs(BuildAhead.getSites()) do
+            if not used[s.id] and s.z == site.z then
+                local d = distSq(s, cur.x, cur.y, cur.z)
+                if d <= range2 and not skipped[skipKey(s)]
+                    and (not bestD or d < bestD or (d == bestD and (s.stack or 0) < (best.stack or 0)))
+                    and not BuildAheadSites.isClaimedByOther(s, me, hours)
+                    and isSiteValid(playerObj, s) and #missingSkills(playerObj, s) == 0
+                    and not BuildAhead.wouldTrap(playerObj, s) then
+                    best, bestD = s, d
+                end
+            end
+        end
+        if not best then break end
+        used[best.id] = true
+        out[#out + 1] = best
+        cur = best
+    end
+    return out
+end
+
+-- A fetch plan for `site` that also brings the materials of the sites expected
+-- next (BuildAheadFetch.planExtra), when the trip holds all of the site's own.
+-- info: the third value of BuildAhead.fetchPlan.
+local function withNextSites(playerObj, site, plan, info)
+    if not info or #plan == 0 then return plan end
+    local room = BuildAheadFetch.freeWeight(playerObj) - BuildAheadFetch.planWeight(plan)
+    if room <= 0 then return plan end
+    local extras = {}
+    for _, s in ipairs(BuildAhead.expectedNext(playerObj, site)) do
+        local logic = planLogic(playerObj, s)
+        if not logic then break end
+        extras[#extras + 1] = { site = s, logic = logic, stand = BuildAhead.keptStand(s) or siteSquare(s) }
+    end
+    if #extras == 0 then return plan end
+    local merged, added = BuildAheadFetch.planExtra(playerObj, plan, info, extras,
+        BuildAhead.getBans(playerObj), carriedContainers(playerObj), room)
+    if #added > 0 then
+        local ids = {}
+        for _, s in ipairs(added) do ids[#ids + 1] = tostring(s.id) end
+        log("site", site.id, "trip brings the materials of sites", table.concat(ids, ","))
+    end
+    return merged
+end
+
 -- build now: the materials are at hand
 function BuildAhead.tryBuildSite(playerObj, site)
     local info = objectInfoByName(site.name)
@@ -854,7 +921,9 @@ function BuildAhead.tryBuildSite(playerObj, site)
     -- a fresh entity: tryBuild hands a copy to the action, and the cached one only draws the ghost
     local e = makeEntity(playerObj, info, site.nSprite)
     if not chooseStand(playerObj, site, e) then return false end
-    log("building site", site.id, site.name, site.x, site.y, site.z)
+    -- the stack level this build is for (the action gets a copy of the entity)
+    e.buildAheadLevel = site.stack
+    log("building site", site.id, site.name, site.x, site.y, site.z, "stack", site.stack)
     pcall(function() log("inputs", BuildAhead.describeInputs(e.buildPanelLogic)) end)
     local before = {}
     for _, a in ipairs(actionQueue(playerObj)) do before[a] = true end
@@ -866,7 +935,7 @@ function BuildAhead.tryBuildSite(playerObj, site)
     -- the walks to the build: when the path fails, the chain goes on without this site
     for _, a in ipairs(actionQueue(playerObj)) do
         if not before[a] and (a.Type == "ISPathFindAction" or a.Type == "ISWalkToTimedAction") then
-            a.buildAheadSite = { name = site.name, x = site.x, y = site.y, z = site.z }
+            a.buildAheadSite = { name = site.name, x = site.x, y = site.y, z = site.z, stack = site.stack }
         end
     end
     claimSite(site)
@@ -893,10 +962,12 @@ function BuildAhead.buildSite(playerObj, site)
     -- the square it is built from: what lies around it is at hand there, not fetched
     local e = siteEntity(playerObj, site)
     if e then pcall(chooseStand, playerObj, site, e, true) end
-    local ok, plan = pcall(BuildAhead.fetchPlan, playerObj, site)
+    local ok, plan, _, info = pcall(BuildAhead.fetchPlan, playerObj, site)
     if not ok then log("fetch plan error", plan); plan = nil end
     if plan and #plan == 0 then return BuildAhead.tryBuildSite(playerObj, site) end
     if plan then
+        local okNext, merged = pcall(withNextSites, playerObj, site, plan, info)
+        if okNext then plan = merged else log("next sites plan error", merged) end
         claimSite(site)
         if BuildAheadFetch.start(playerObj, site, plan) then return true end
     end
@@ -1141,7 +1212,7 @@ local function hookBuildAction()
             if self.item and self.item.buildAheadSite then
                 log("build action", name, "at", self.x, self.y, self.z)
                 local objName = self.item.objectInfo and self.item.objectInfo:getName()
-                local site = objName and siteOn(objName, self.x, self.y, self.z)
+                local site = objName and siteOn(objName, self.x, self.y, self.z, self.item.buildAheadLevel)
                 if site then
                     directSites[site.id] = nil
                     unclaimSite(site)
@@ -1161,7 +1232,7 @@ local function hookBuildAction()
         if name then
             -- a site built here (by the scheduler or by hand): skip it now, and remove it
             -- once the object is there; if it stays buildable the build failed
-            local site = siteOn(name, self.x, self.y, self.z)
+            local site = siteOn(name, self.x, self.y, self.z, self.item.buildAheadLevel)
             if site then
                 skipped[skipKey(site)] = true
                 directSites[site.id] = nil
@@ -1402,7 +1473,7 @@ local function onBuildWalkStopped(walk)
     local s = walk.buildAheadSite
     walk.buildAheadSite = nil
     local playerObj = walk.character
-    local site = siteOn(s.name, s.x, s.y, s.z)
+    local site = siteOn(s.name, s.x, s.y, s.z, s.stack)
     if site then unclaimSite(site) end
     if walk.buildAheadTookOver or not walk.buildAheadStopInUpdate then
         -- the player took over, or another action cleared the queue

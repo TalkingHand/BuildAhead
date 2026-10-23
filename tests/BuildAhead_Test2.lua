@@ -21,6 +21,10 @@
 --      crate is built from the square next to it whose 3x3 holds them), nothing is fetched
 --   T8 stacked crates: three clicks on one square plan three levels, the third ghost sits on
 --      two, a fourth is refused; the chain builds all three on that square and stops
+--   T8b stacked crates built while the level below is still listed (CHECK_DELAY_MS raised):
+--      each build counts for its own level, no level is built twice, all sites go
+--   T9 materials for the next sites: four crates, materials in one container: a trip brings
+--      the next sites' materials while the inventory holds them (fewer trips), never into a bag
 --   T6 persistence, part 1: sites and a ban are left for the reload run
 --      (BuildAheadTest2.reloadStart / reloadPoll, a second `pzt run KEEP_SAVE=1`)
 -- Results: "[BuildAheadTest2]" lines; failures also as "[PZTest] FAIL".
@@ -1023,6 +1027,115 @@ local function scenarioStack()
     check("T8 a full stack is refused by the cursor", not makeCursor(info, 1):isValid(sq(S.x, S.y, S.z)))
 end
 
+-- T8b: the next level is built while the level below is still listed (its site goes
+-- CHECK_DELAY_MS after the build; a short build, e.g. Handy or a fast game, ends
+-- sooner). Each build must count for its own level: three crates, no rebuilt level,
+-- and every site removed once the delay has passed.
+local function scenarioStackFast()
+    local p = player()
+    clearSites()
+    clearBag()
+    local info = entityInfo(CRATE)
+    if not check("T8b recipe " .. CRATE, info ~= nil) then return end
+    local A = findArea(6, 6, "T8b")
+    local S = { x = A.x + 3, y = A.y + 3, z = 0 }
+    teleport(A.x + 1, S.y, 0)
+    wait(60)
+    local inv = p:getInventory()
+    inv:AddItem("Base.BallPeenHammerForged")
+    local need = cost(info)
+    for t, n in pairs(need) do addTo(inv, t, n * 5) end
+    R.performed = {}
+    R.checkDelay = BuildAhead.CHECK_DELAY_MS
+    BuildAhead.CHECK_DELAY_MS = 20000
+    for _ = 1, 3 do makeCursor(info, 1):tryBuild(S.x, S.y, S.z) end
+    waitIdle(60 * 300, "T8b chain")
+    wait(120)
+    local t0 = getTimestampMs()
+    for i, b in ipairs(R.performed) do log("T8b built", i, b.name, b.x, b.y, b.z) end
+    check("T8b three crates on the square", countAt(CRATE, S.x, S.y, S.z) == 3, objectsAt(S.x, S.y, S.z))
+    check("T8b three builds", #R.performed == 3, "builds " .. #R.performed)
+    -- the sites go when the delay has passed
+    local frames = 0
+    while #BuildAhead.getSites() > 0 and frames < 60 * 60 do
+        wait(1)
+        frames = frames + 1
+    end
+    BuildAhead.CHECK_DELAY_MS = R.checkDelay
+    R.checkDelay = nil
+    local left = {}
+    for _, s in ipairs(BuildAhead.getSites()) do left[#left + 1] = tostring(s.stack) end
+    check("T8b all levels removed", #left == 0, "left " .. table.concat(left, ",") .. " after "
+        .. (getTimestampMs() - t0) .. " ms")
+end
+
+-- ---------------------------------------------------------------- T9 materials for the next sites
+
+-- four crates in a row, their materials in one container further off: a trip brings
+-- the materials of as many of the next sites as the inventory holds, so the chain
+-- needs ceil(4 / sites per trip) fetch trips, not four; nothing goes into the worn bag
+local function scenarioBatch()
+    local p = player()
+    clearSites()
+    clearBag()
+    local info = entityInfo(CRATE)
+    if not check("T9 recipe " .. CRATE, info ~= nil) then return end
+    local A = findArea(14, 6, "T9")
+    teleport(A.x + 1, A.y + 3, 0)
+    wait(60)
+    local inv = p:getInventory()
+    inv:AddItem("Base.BallPeenHammerForged")
+    local bag = inv:AddItem("Base.Bag_Schoolbag")
+    pcall(function() p:setWornItem(bag:canBeEquipped(), bag) end)
+    check("T9 bag worn", p:isEquipped(bag))
+    local need = cost(info)
+    local siteW = 0
+    for t, n in pairs(need) do siteW = siteW + n * instanceItem(t):getUnequippedWeight() end
+    local room = BuildAheadFetch.freeWeight(p)
+    local perTrip = math.floor(room / siteW)
+    local N = 4
+    local _, store = newCrate(sq(A.x + 12, A.y + 5, 0))
+    for t, n in pairs(need) do addTo(store, t, n * N) end
+    log("T9 site weight", string.format("%.1f", siteW), "room", string.format("%.1f", room), "sites per trip", perTrip)
+    check("T9 at least one site per trip", perTrip >= 1)
+    -- count the fetch jobs and where the transfers go
+    local origStart, origTransfer = BuildAheadFetch.start, ISInventoryTransferUtil.newInventoryTransferAction
+    local jobs, toBag = 0, 0
+    BuildAheadFetch.start = function(...)
+        local ok = origStart(...)
+        if ok then jobs = jobs + 1 end
+        return ok
+    end
+    ISInventoryTransferUtil.newInventoryTransferAction = function(chr, item, src, dest, ...)
+        if chr == p and dest ~= inv then toBag = toBag + 1 end
+        return origTransfer(chr, item, src, dest, ...)
+    end
+    R.restore = function()
+        BuildAheadFetch.start = origStart
+        ISInventoryTransferUtil.newInventoryTransferAction = origTransfer
+    end
+    R.performed = {}
+    for i = 1, N do makeCursor(info, 1):tryBuild(A.x + 1 + 2 * i, A.y + 1, 0) end
+    waitIdle(60 * 600, "T9 chain")
+    wait(120)
+    R.restore()
+    R.restore = nil
+    local built = 0
+    for i = 1, N do
+        if hasObject(A.x + 1 + 2 * i, A.y + 1, 0, CRATE) then built = built + 1 end
+    end
+    check("T9 all crates built", built == N, "built " .. built)
+    local expected = perTrip >= 1 and math.ceil(N / perTrip) or N
+    check("T9 fetch trips for the next sites", jobs == expected, "jobs " .. jobs .. " expected " .. expected)
+    check("T9 nothing put into the worn bag", toBag == 0, "transfers into a bag " .. toBag)
+    local left = 0
+    for t in pairs(need) do left = left + count(store, t) end
+    check("T9 store emptied", left == 0, "left " .. left)
+    check("T9 all sites removed", #BuildAhead.getSites() == 0, "sites " .. #BuildAhead.getSites())
+    pcall(function() p:removeWornItem(bag) end)
+    inv:DoRemoveItem(bag)
+end
+
 -- ---------------------------------------------------------------- T6 persistence, part 1
 
 local PERSIST_FILE = "buildahead_persist.txt"
@@ -1063,6 +1176,8 @@ local SCENARIOS = {
     { "T5 many sites", scenarioMany },
     { "T7 furniture stand", scenarioFurnitureStand },
     { "T8 stacked crates", scenarioStack },
+    { "T8b stacked crates, built fast", scenarioStackFast },
+    { "T9 materials for the next sites", scenarioBatch },
     { "T6 persistence (save)", scenarioPersistSave },
 }
 
@@ -1074,6 +1189,14 @@ local function reset()
     pcall(function() ISTimedActionQueue.clear(p) end)
     BuildAheadTrap.standFilter = nil
     ISBuildMenu.cheat = false
+    if R.checkDelay then
+        BuildAhead.CHECK_DELAY_MS = R.checkDelay
+        R.checkDelay = nil
+    end
+    if R.restore then
+        pcall(R.restore)
+        R.restore = nil
+    end
     pcall(clearSites)
     if p:getZ() >= 1 then pcall(teleport, math.floor(p:getX()) + 3, math.floor(p:getY()) + 3, 0) end
 end

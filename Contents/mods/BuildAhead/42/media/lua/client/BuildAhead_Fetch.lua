@@ -9,14 +9,17 @@
 --
 -- A fetch job, per site: walk to the nearest source and take what is needed
 -- (ISInventoryTransferAction, ISGrabItemAction for floor items), source after
--- source while the inventory and the worn bags have room (up to their
--- capacity: the player may be overloaded for the trip); then walk to the
--- site's stand square (BuildAhead.standFor: one square per site, kept for all
--- trips). When the room stopped the trip short, drop the load on the stand
--- square (spread over its 3x3 if a square is full) and go again; the last trip
--- keeps its load. What lies in the stand's 3x3 counts as at hand and is never
--- fetched. Once the materials are at hand (carried plus dropped), build
--- (BuildAhead.tryBuildSite).
+-- source while the inventory has room (the inventory itself, up to its
+-- capacity, not the worn bags: moving items in and out of a bag is slow; the
+-- player may be overloaded for the trip); then walk to the site's stand square
+-- (BuildAhead.standFor: one square per site, kept for all trips). When the room
+-- stopped the trip short, drop the load on the stand square (spread over its
+-- 3x3 if a square is full) and go again; the last trip keeps its load. What
+-- lies in the stand's 3x3 counts as at hand and is never fetched. Once the
+-- materials are at hand (carried plus dropped), build (BuildAhead.tryBuildSite).
+-- A trip that holds all of its site's materials also brings the materials of
+-- the sites the chain is expected to build next, in that order, while the room
+-- lasts (F.planExtra); they stay in the inventory for those builds.
 -- Tools are kept in the inventory: a tool taken from a container (or the floor)
 -- goes back there when the chain ends, and the weapon held before the chain
 -- started is equipped again.
@@ -236,8 +239,9 @@ end
 -- Inputs of the logic's recipe that its fill leaves unsatisfied, with how much
 -- is still short. The fill assigns nothing to an input it cannot satisfy in
 -- full, so what is there already is counted here from `base` (the containers
--- the logic was filled from); `taken` gets the ids counted.
-function F.shortInputs(logic, base, bans, playerObj, taken)
+-- the logic was filled from); `taken` gets the ids counted. all: every input
+-- counts as unsatisfied (the logic is not filled), only `base` is counted.
+function F.shortInputs(logic, base, bans, playerObj, taken, all)
     local out = {}
     local recipe = logic:getRecipe()
     local inputs = recipe and recipe:getInputs()
@@ -246,8 +250,8 @@ function F.shortInputs(logic, base, bans, playerObj, taken)
     for i = 0, inputs:size() - 1 do
         local input = inputs:get(i)
         if not input:isAutomationOnly() and input:getResourceType() == ResourceType.Item then
-            local d = data:getDataForInputScript(input)
-            if not (d and d:isInputItemsSatisfied()) then
+            local d = not all and data:getDataForInputScript(input)
+            if all or not (d and d:isInputItemsSatisfied()) then
                 local uses = not input:isItemCount()
                 local types = {}
                 local possible = input:getPossibleInputItems()
@@ -307,7 +311,8 @@ F.standOf = standOf
 -- {} when nothing is short. nil and the names still missing ("Plank x2") when
 -- the sources within range are not enough. atHand: the square the site is built
 -- from; what lies in its 3x3 counts as there already and is not fetched.
--- reuse: see F.scan.
+-- reuse: see F.scan. A plan comes with { taken, sources, logic } as the third
+-- value (the ids it counted, the sources searched nearest first) for F.planExtra.
 function F.plan(playerObj, logic, bans, cx, cy, cz, atHand, base, reuse)
     local taken = {}
     local shorts = F.shortInputs(logic, base, bans, playerObj, taken)
@@ -367,7 +372,92 @@ function F.plan(playerObj, logic, bans, cx, cy, cz, atHand, base, reuse)
     for _, src in ipairs(sources) do
         if picks[src] then plan[#plan + 1] = { src = src, items = picks[src] } end
     end
-    return plan
+    return plan, nil, { taken = taken, sources = sources, logic = logic }
+end
+
+-- weight of the items a plan takes
+function F.planWeight(plan)
+    local w = 0
+    for _, entry in ipairs(plan) do
+        for _, e in ipairs(entry.items) do w = w + e.item:getUnequippedWeight() end
+    end
+    return w
+end
+
+-- Materials for the sites the chain is expected to build after a plan's site,
+-- added to that plan's trip. extras: { { site, logic, stand } } in the order the
+-- chain would build them (logic: a BuildLogic of the site's recipe, not filled;
+-- stand: the square it is built from, whose 3x3 counts as at hand there). Each
+-- site is added whole or not at all, while `room` (weight) lasts; the first site
+-- whose materials are not all found, or do not fit, ends the list. Tools are not
+-- fetched for them (the chain keeps its tools in the inventory). info: the third
+-- value of F.plan; base: what the player carries (counted first, less what the
+-- plan's own site uses). Returns the plan with the extra items (e.extra) and the
+-- sites added.
+function F.planExtra(playerObj, plan, info, extras, bans, base, room)
+    local taken = info.taken
+    -- what the first site's fill uses from the inventory is not there for the others
+    pcall(function()
+        local inputs = info.logic:getRecipe():getInputs()
+        local data = info.logic:getRecipeData()
+        for i = 0, inputs:size() - 1 do
+            local d = data:getDataForInputScript(inputs:get(i))
+            for n = 0, (d and d:getAppliedItemsCount() or 0) - 1 do taken[d:getAppliedItem(n):getID()] = true end
+        end
+    end)
+    local picks = {}
+    for _, entry in ipairs(plan) do picks[entry.src] = entry.items end
+    local added = {}
+    for _, x in ipairs(extras) do
+        -- counted on a trial table, kept only when the whole site is found and fits
+        local trial = setmetatable({}, { __index = taken })
+        local shorts = {}
+        for _, s in ipairs(F.shortInputs(x.logic, base, bans, playerObj, trial, true)) do
+            if not s.tool then shorts[#shorts + 1] = s end
+        end
+        local stand = standOf(x.stand)
+        local mine, w = {}, 0
+        for _, src in ipairs(info.sources) do
+            local near = atHandOf(src, stand)
+            for _, s in ipairs(shorts) do
+                for _, e in ipairs(F.sourceItems(src)) do
+                    if s.short <= 0 then break end
+                    local id = e.item:getID()
+                    if not trial[id] and usable(s, e.item, playerObj, bans) then
+                        if not near and src.reachable == nil then src.reachable = F.reachable(playerObj, src) end
+                        if not near and not src.reachable then break end
+                        trial[id] = true
+                        s.short = s.short - amountOf(s, e.item)
+                        if not near then
+                            w = w + e.item:getUnequippedWeight()
+                            mine[#mine + 1] = { src = src, e = { item = e.item, wo = e.wo, extra = true } }
+                        end
+                    end
+                end
+            end
+        end
+        local found = true
+        for _, s in ipairs(shorts) do
+            if s.short > 0 then found = false end
+        end
+        if not found or w > room then
+            log("site", x.site.id, "not brought along:", found and string.format("%.1f over the room", w - room)
+                or "materials not found")
+            break
+        end
+        for id in pairs(trial) do taken[id] = true end
+        for _, m in ipairs(mine) do
+            picks[m.src] = picks[m.src] or {}
+            table.insert(picks[m.src], m.e)
+        end
+        room = room - w
+        added[#added + 1] = x.site
+    end
+    local out = {}
+    for _, src in ipairs(info.sources) do
+        if picks[src] then out[#out + 1] = { src = src, items = picks[src] } end
+    end
+    return out, added
 end
 
 -- ---------------------------------------------------------------- job
@@ -400,9 +490,8 @@ function F.beginChain(playerObj)
         secondary = playerObj:getSecondaryHandItem(), borrowed = {} }
 end
 
--- Where fetched items go: the inventory, then the bags the player wears or
--- holds. Each is filled up to its capacity, as vanilla lets a transfer do:
--- the player may end up overloaded (slower) for the trip.
+-- What the player carries: the inventory and the bags it wears or holds.
+-- Fetched items go into the inventory itself only (F.freeWeight).
 function F.carryContainers(playerObj)
     local inv = playerObj:getInventory()
     local out = { inv }
@@ -430,53 +519,46 @@ local function roomIn(playerObj, c)
     return c:getEffectiveCapacity(playerObj) - c:getContentsWeight()
 end
 
--- weight the player can still take in the inventory and the bags it wears or holds
+-- Weight the player can still take in the inventory itself, up to its capacity
+-- (vanilla's hard limit, above the weight the player carries without being
+-- overloaded): fetched items do not go into the worn bags, since moving them in
+-- and out of a bag takes long.
 function F.freeWeight(playerObj)
-    local free = 0
-    for _, c in ipairs(F.carryContainers(playerObj)) do free = free + math.max(0, roomIn(playerObj, c)) end
-    return free
+    return math.max(0, roomIn(playerObj, playerObj:getInventory()))
 end
 
--- Trip steps from a plan, as much as the inventory and the worn bags hold
--- (at least one item). Each item gets the container it goes into (e.dest).
+-- Trip steps from a plan, as much as the inventory holds (at least one item):
+-- the items of the job's site first, then the extra items (F.planExtra) in what
+-- is left. Each item gets the container it goes into (e.dest).
 local function tripSteps(job, plan)
     local p = job.player
     local inv = p:getInventory()
-    local bins = {}
-    for _, c in ipairs(F.carryContainers(p)) do
-        -- what goes into a worn bag also weighs on the inventory, less the bag's reduction
-        local bag = c ~= inv and c:getContainingItem()
-        local keep = bag and instanceof(bag, "InventoryContainer") and (1 - bag:getWeightReduction() / 100) or 1
-        bins[#bins + 1] = { c = c, free = roomIn(p, c), keep = keep, main = c == inv }
-    end
-    local main = bins[1]
-    -- tools stay in the inventory itself (the build equips them from there), and
-    -- floor items too: in multiplayer the server grabs into the inventory only
-    local function place(w, mainOnly)
-        for _, b in ipairs(bins) do
-            if (b.main or not mainOnly) and w <= b.free and (b.main or w * b.keep <= main.free) then
-                b.free = b.free - w
-                if not b.main then main.free = main.free - w * b.keep end
-                return b.c
+    local free = roomIn(p, inv)
+    local takes, full, count = {}, false, 0
+    for pass = 1, 2 do
+        -- extra items only on a trip that holds the whole site
+        if pass == 2 and full then break end
+        for _, entry in ipairs(plan) do
+            for _, e in ipairs(entry.items) do
+                if (pass == 2) == (e.extra == true) then
+                    local w = e.item:getUnequippedWeight()
+                    if w <= free or count == 0 then
+                        free = free - w
+                        count = count + 1
+                        e.dest = inv
+                        takes[entry] = takes[entry] or {}
+                        table.insert(takes[entry], e)
+                    elseif not e.extra then
+                        -- left for the next trip; a lighter item further on may still fit
+                        full = true
+                    end
+                end
             end
         end
     end
-    local steps, full, count = {}, false, 0
+    local steps = {}
     for _, entry in ipairs(plan) do
-        local take = {}
-        for _, e in ipairs(entry.items) do
-            local dest = place(e.item:getUnequippedWeight(), e.tool or entry.src.kind == "floor")
-            if not dest and count == 0 then dest = inv end
-            if dest then
-                count = count + 1
-                e.dest = dest
-                take[#take + 1] = e
-            else
-                -- left for the next trip; a lighter item further on may still fit
-                full = true
-            end
-        end
-        if #take > 0 then steps[#steps + 1] = { kind = "take", src = entry.src, items = take } end
+        if takes[entry] then steps[#steps + 1] = { kind = "take", src = entry.src, items = takes[entry] } end
     end
     if #steps == 0 then return nil end
     steps[#steps + 1] = { kind = "site" }
@@ -582,7 +664,7 @@ local function checkTake(job, st)
         if inInventory(job.player, id) then
             got = got + 1
             F.stats.takes = F.stats.takes + 1
-            job.carried[#job.carried + 1] = { id = id, tool = e.tool }
+            job.carried[#job.carried + 1] = { id = id, tool = e.tool, extra = e.extra }
             if e.tool and F.chain then
                 table.insert(F.chain.borrowed, { id = id, src = st.src })
             end
@@ -615,10 +697,11 @@ end
 local function queueDrop(job)
     local p = job.player
     if not job.dropIds then
-        -- tools stay in the inventory: the build equips them from there
+        -- tools stay in the inventory: the build equips them from there; so do the
+        -- materials brought along for the next sites
         job.dropIds, job.dropLoad = {}, {}
         for _, c in ipairs(job.carried) do
-            if not c.tool then job.dropIds[#job.dropIds + 1] = c.id end
+            if not c.tool and not c.extra then job.dropIds[#job.dropIds + 1] = c.id end
         end
         job.carried = {}
         job.dropSquares = dropSquares(job)
