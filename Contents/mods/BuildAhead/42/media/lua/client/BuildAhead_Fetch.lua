@@ -513,10 +513,31 @@ local function inInventory(playerObj, id)
     end
 end
 
--- weight a container can still take (getCapacityWeight lags behind items just
--- added; getContentsWeight counts them)
+-- Weight of the player's inventory as vanilla's IsoGameCharacter.getInventoryWeight
+-- counts it: worn and held items at their equipped weight, hotbar items at theirs.
+-- getContentsWeight counts worn items in full (a dressed player had almost no room
+-- and carried one item per trip); getCapacityWeight is 0 with unlimited carry or
+-- in debug ghost mode. Summed here, so items just added count at once.
+local function inventoryWeight(playerObj)
+    local w = 0
+    local items = playerObj:getInventory():getItems()
+    for i = 0, items:size() - 1 do
+        local it = items:get(i)
+        if it:getAttachedSlot() > -1 and not playerObj:isEquipped(it) then
+            w = w + it:getHotbarEquippedWeight()
+        elseif playerObj:isEquipped(it) or it:isFakeEquipped(playerObj) then
+            w = w + it:getEquippedWeight()
+        else
+            w = w + it:getUnequippedWeight()
+        end
+    end
+    return w
+end
+
+-- weight a container can still take
 local function roomIn(playerObj, c)
-    return c:getEffectiveCapacity(playerObj) - c:getContentsWeight()
+    local used = c == playerObj:getInventory() and inventoryWeight(playerObj) or c:getContentsWeight()
+    return c:getEffectiveCapacity(playerObj) - used
 end
 
 -- Weight the player can still take in the inventory itself, up to its capacity

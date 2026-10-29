@@ -7,7 +7,7 @@
 "InputScript": ["getPossibleInputItems","isAutomationOnly","getResourceType","getIntAmount","getAmount","isItemCount","isTool","isKeep","canUseItem"],
 "Item": ["getFullName","getDisplayName","getScriptObjectFullType"],
 "ItemContainer": ["getAllTypeEvalRecurse","isEmpty","isLockedToCharacter","getItems","getItemById","getEffectiveCapacity","getContentsWeight","getContainingItem"],
-"InventoryItem": ["getFullType","getID","getContainer","getUnequippedWeight","isEquipped"],
+"InventoryItem": ["getFullType","getID","getContainer","getUnequippedWeight","isEquipped","getAttachedSlot","getHotbarEquippedWeight","getEquippedWeight","isFakeEquipped"],
 "DrainableComboItem": ["getCurrentUses"],
 "InventoryContainer": ["getInventory","getWeightReduction"],
 "BuildLogic": ["setContainers","setRecipe","getRecipe","getRecipeData","isManualSelectInputs","setManualSelectInputs","autoPopulateInputs","clearManualInputsFor","offerInputItem","canPerformCurrentRecipe","getInputCount","refresh","stopCraftAction","startCraftAction","getSelectedBuildObject","cachedCanPerformCurrentRecipe","isCraftActionInProgress"],

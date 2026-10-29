@@ -983,6 +983,22 @@ local function scenarioStack()
     local S = { x = A.x + 3, y = A.y + 3, z = 0 }
     teleport(A.x + 1, S.y, 0)
     wait(60)
+    -- no materials yet: level 1 cannot be built, so the levels above show yellow too
+    for _ = 1, 3 do makeCursor(info, 1):tryBuild(S.x, S.y, S.z) end
+    local planned = {}
+    for _, s in ipairs(BuildAhead.getSites()) do
+        if s.x == S.x and s.y == S.y and s.z == S.z and s.stack then planned[s.stack] = s end
+    end
+    if planned[3] then
+        local st = {}
+        for i = 1, 3 do st[i] = BuildAhead.siteState(p, planned[i]) end
+        check("T8 level 1 without materials not buildable", st[1] ~= "buildable", st[1])
+        check("T8 levels above it missing (yellow)", st[2] == "missing" and st[3] == "missing", st[2] .. "," .. st[3])
+    else
+        check("T8 three levels planned without materials", false)
+    end
+    clearSites()
+    wait(60)
     local inv = p:getInventory()
     inv:AddItem("Base.BallPeenHammerForged")
     local need = cost(info)
@@ -1011,6 +1027,11 @@ local function scenarioStack()
     end
     if levels == 3 then
         check("T8 a fourth planned level is refused by the cursor", not makeCursor(info, 1):isValid(sq(S.x, S.y, S.z)))
+    end
+    -- a level waits for the planned one below (materials are there for all three)
+    if stack[3] then
+        check("T8 upper levels wait for level 1", not BuildAhead.canBuildSite(p, stack[2])
+            and not BuildAhead.canBuildSite(p, stack[3]))
     end
     waitIdle(60 * 300, "T8 chain")
     wait(120)

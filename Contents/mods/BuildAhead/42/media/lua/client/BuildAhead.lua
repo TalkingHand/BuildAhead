@@ -356,6 +356,23 @@ local function nextLevel(x, y, z)
     return top + 1
 end
 
+-- a lower level of the same stack is still planned (not built a moment ago, not in
+-- `done`): a level stands on the one below, so the chain builds them bottom up
+-- Returns the level right below that is planned, or nil.
+local function lowerLevelPlanned(site, done)
+    if not site.stack then return nil end
+    local below
+    for _, s in ipairs(BuildAhead.getSites()) do
+        if s.stack and s.stack < site.stack and s.name == site.name and s.x == site.x and s.y == site.y
+            and s.z == site.z and not (done and done[s.id])
+            and not stackBuilt[stackKey(s.name, s.x, s.y, s.z, s.stack)]
+            and (not below or s.stack > below.stack) then
+            below = s
+        end
+    end
+    return below
+end
+
 -- where a stackable site's ghost stands: on the real stack and the planned levels below it
 local function stackBase(playerObj, site, si)
     local sq = siteSquare(site)
@@ -766,14 +783,17 @@ end
 function BuildAhead.canBuildSite(playerObj, site)
     -- skills first: a site planned by another player may need more than this player has,
     -- and the chain must not walk off to fetch materials for it
-    return isSiteValid(playerObj, site) and #missingSkills(playerObj, site) == 0
+    return not lowerLevelPlanned(site) and isSiteValid(playerObj, site) and #missingSkills(playerObj, site) == 0
         and not BuildAhead.wouldTrap(playerObj, site) and materialsAvailable(playerObj, site)
 end
 
--- "buildable", "missing" (valid, but the skill is too low or the materials are neither at hand
--- nor within range), "trap" (building it would wall the player in) or "blocked"
+-- "buildable", "missing" (valid, but the skill is too low, the materials are neither at hand
+-- nor within range, or the planned level below is not buildable), "trap" (building it would wall the player in) or "blocked"
 function BuildAhead.siteState(playerObj, site)
     if not isSiteValid(playerObj, site) then return "blocked" end
+    -- a level whose planned level below cannot be built now waits for it
+    local below = lowerLevelPlanned(site)
+    if below and BuildAhead.siteState(playerObj, below) ~= "buildable" then return "missing" end
     if #missingSkills(playerObj, site) > 0 then return "missing" end
     if BuildAhead.wouldTrap(playerObj, site) then return "trap" end
     return materialsAvailable(playerObj, site) and "buildable" or "missing"
@@ -831,6 +851,7 @@ local function skipKey(site)
 end
 local checks = {}   -- { name, x, y, z, at }: built here, see whether the object is really there
 BuildAhead.CHECK_DELAY_MS = 1000 -- in multiplayer the built object arrives a little after the action ends
+BuildAhead.CHECK_WAIT_MS = 8000  -- a build not seen yet is checked again until this long after the action
 
 local function distSq(site, x, y, z)
     return (site.x - x) ^ 2 + (site.y - y) ^ 2 + ((site.z - z) * 3) ^ 2
@@ -875,7 +896,7 @@ function BuildAhead.expectedNext(playerObj, site)
                 local d = distSq(s, cur.x, cur.y, cur.z)
                 if d <= range2 and not skipped[skipKey(s)]
                     and (not bestD or d < bestD or (d == bestD and (s.stack or 0) < (best.stack or 0)))
-                    and not BuildAheadSites.isClaimedByOther(s, me, hours)
+                    and not BuildAheadSites.isClaimedByOther(s, me, hours) and not lowerLevelPlanned(s, used)
                     and isSiteValid(playerObj, s) and #missingSkills(playerObj, s) == 0
                     and not BuildAhead.wouldTrap(playerObj, s) then
                     best, bestD = s, d
@@ -1240,7 +1261,8 @@ local function hookBuildAction()
             end
             -- a stack stays buildable after a level is built: count the objects instead
             table.insert(checks, { name = name, x = self.x, y = self.y, z = self.z, stack = site and site.stack,
-                before = before, at = getTimestampMs() + BuildAhead.CHECK_DELAY_MS, refresh = self.item.buildAheadSite })
+                before = before, at = getTimestampMs() + BuildAhead.CHECK_DELAY_MS,
+                giveUpAt = getTimestampMs() + BuildAhead.CHECK_WAIT_MS, refresh = self.item.buildAheadSite })
         end
         if self.item and self.item.buildAheadSite then refreshBuildPanel(playerObj) end
         -- the new object changes what the other sites would close off
@@ -1265,17 +1287,26 @@ local function runChecks()
                     cache[site.id] = nil
                     local done
                     if c.stack then
-                        stackBuilt[stackKey(c.name, c.x, c.y, c.z, c.stack)] = nil
                         done = countObjects(c.name, c.x, c.y, c.z) > (c.before or 0)
                     else
                         done = not isSiteValid(playerObj, site)
                     end
-                    if done then BuildAhead.removeSite(site.id) end
+                    if done then
+                        BuildAhead.removeSite(site.id)
+                    elseif now < (c.giveUpAt or 0) then
+                        -- the object has not arrived from the server yet: look again soon
+                        -- (a level given up on too early stayed planned, its ghost on top of it)
+                        c.at = now + 250
+                        table.insert(checks, c)
+                        c.wait = true
+                    end
                     break
                 end
             end
+            if c.stack and not c.wait then stackBuilt[stackKey(c.name, c.x, c.y, c.z, c.stack)] = nil end
             -- in multiplayer the used materials leave the inventory a little after the action
-            if c.refresh and playerObj then refreshBuildPanel(playerObj) end
+            if c.refresh and playerObj and not c.wait then refreshBuildPanel(playerObj) end
+            c.wait = nil
         end
     end
 end
@@ -1289,6 +1320,8 @@ end
 -- ---------------------------------------------------------------- ghosts
 
 local function renderGhost(playerObj, site, now)
+    -- a level just built stands there itself; its site goes once the check sees it
+    if site.stack and stackBuilt[stackKey(site.name, site.x, site.y, site.z, site.stack)] then return end
     local e = siteEntity(playerObj, site)
     if not e then return end
     local c = cache[site.id]

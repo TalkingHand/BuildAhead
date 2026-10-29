@@ -14,7 +14,7 @@
 #  4. MP server: entity rebuilt from new() args, .containers on server copy, server-side player ModData for bans
 #  5. walk hooks: takeover vs failure told apart by forceStop() being called from inside update()
 #  6. build window UI internals (ISWidgetInput, ISCraftInventoryPanel, ISWidgetBuildControl): not pcall'd
-#  7. ISBuildAction lifecycle + MP perform returning early on the client (CHECK_DELAY_MS)
+#  7. ISBuildAction lifecycle + MP perform returning early on the client (CHECK_DELAY_MS, checked again until CHECK_WAIT_MS)
 #  8. constants copied from vanilla (50 weight floor cap, wall/door property lists, vehicle part ids)
 #  9. global ModData sync (OnReceiveGlobalModData, ModData.add/request): no vanilla Lua uses them
 #
@@ -142,7 +142,7 @@ assume	in MP, item moves queued together fail after the first, so they are queue
 assume	SETTLE_MS=400 lets MP item moves arrive after the queue empties	F:35
 assume	ISDropWorldItemAction refuses more than 50 weight per square (copied constant); dropped item must be in the main inventory	F:38,629-634; ISDropWorldItemAction.lua:5-18
 assume	ISGrabItemAction always grabs into the main inventory	F:451-452; ISGrabItemAction.lua:192
-assume	getCapacityWeight lags behind items just added, getContentsWeight doesn't	F:roomIn (unverified)
+assume	the player's inventory weight = IsoGameCharacter.getInventoryWeight's sum (attached & not equipped: getHotbarEquippedWeight; equipped or fake-equipped: getEquippedWeight; else getUnequippedWeight), mirrored in Lua (getCapacityWeight returns 0 for unlimited carry / debug ghost mode; getContentsWeight counts worn items in full)	F:inventoryWeight, roomIn; IsoGameCharacter.getInventoryWeight, ItemContainer.getCapacityWeight (javap 42.21.0)
 assume	the player's own inventory holds up to its capacity (ItemContainer() default 50, getEffectiveCapacity skips the Organized/Disorganized factor for a character's inventory), above getMaxWeight (overloaded, not refused); fetched items go there only, not into bags	F:freeWeight, tripSteps; ItemContainer.<init>, getEffectiveCapacity, hasRoomFor (javap 42.21.0)
 assume	a BuildLogic's applied items (getAppliedItemsCount/getAppliedItem per input) are the items its fill would use	F:planExtra (reserved for the first site; pcall'd)
 assume	materials at hand = inventory + loot-window containers + floor 3x3, as vanilla getContainers / GetAllGroundItemsForPlayer	F:3-5; ISInventoryPaneContextMenu.lua:2425, ISBuildIsoEntity.lua:1111
