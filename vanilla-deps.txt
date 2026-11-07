@@ -27,7 +27,8 @@ lua-wrap	ISBuildIsoEntity:walkTo	BA:1216-1221; ISBuildIsoEntity.lua:9. Original 
 lua-wrap	ISBuildIsoEntity:render	BA:1080-1093; ISBuildIsoEntity.lua:70. Original called; for a stackable cursor over planned levels, inside the getTotalTableHeight raise below
 lua-wrap	ISMoveableSpriteProps:getTotalTableHeight	BA:1072-1078; shared/Moveables/ISMoveableSpriteProps.lua:1555. Original called; adds the planned levels' height only while the build cursor renders
 lua-wrap	ISBuildIsoEntity:create	SV:78-92; ISBuildIsoEntity.lua:501. Original always called, after re-filling inputs without banned types. Dedicated server only (isServer); file load + OnGameBoot + OnServerStarted
-lua-wrap	ISBuildAction:start	BA:953-973; client/BuildingObjects/TimedActions/ISBuildAction.lua:127. Original called after container/input refresh + stopCraftAction/startCraftAction(self)
+lua-wrap	ISBuildAction:start	BA:953-973; client/BuildingObjects/TimedActions/ISBuildAction.lua:127. Original called after container/input refresh + stopCraftAction/startCraftAction(self); sets buildAheadNoGo when canPerformCurrentRecipe is false
+lua-wrap	ISBuildAction:isValid	BA hookBuildAction; ISBuildAction.lua:38. Returns false for a scheduler build rejected at start (skips the site), else original
 lua-wrap	ISBuildAction:stop / forceStop	BA:977-991; ISBuildAction.lua:156,184. Original called (unclaims site)
 lua-wrap	ISBuildAction:perform	BA:993-1019; ISBuildAction.lua:201. Original called first, then chain scheduling
 lua-wrap	ISWidgetBuildControl:prerender	BA:1200-1211; client/Entity/ISUI/BuildRecipe/ISWidgetBuildControl.lua:159. Original called, then buttonCraft.enable forced true
@@ -68,7 +69,7 @@ lua-call	AdjacentFreeTileFinder.Find(sq, player)	F:216; shared/Util/AdjacentFree
 lua-call	getPlayerLoot(n):refreshBackpacks()	BA:216; client/ISUI/PlayerData/ISPlayerData.lua:93, client/ISUI/ISInventoryPage.lua:1537
 lua-call	getPlayerInventory(n).inventoryPane.inventoryPage.backpacks[i].inventory	BA:224,1090; ISInventoryPage.lua:89
 lua-call	ISToolTip / ISButton / ISScrollingListBox / ISContextMenu:addOption	BA:1178-1193, UI:57-173; client/ISUI/ISToolTip.lua, ISButton.lua, ISScrollingListBox.lua, ISContextMenu.lua, ISUIElement.lua
-lua-field	ISBuildIsoEntity: character, objectInfo, nSprite, north, player, blockBuild, buildPanelLogic, containers, previousStages, isWallLike, dragNilAfterPlace, blockAfterPlace, equipBothHandItem, firstItem, secondItem	BA:252-264,609,884-917; ISBuildIsoEntity.lua:875-948, ISBuildingObject.lua:438-480
+lua-field	ISBuildIsoEntity: character, objectInfo, nSprite, north, player, blockBuild, buildPanelLogic, containers, previousStages, isWallLike, dragNilAfterPlace, blockAfterPlace, equipBothHandItem, firstItem, firstPredicate, secondItemBA:252-264,609,884-917; ISBuildIsoEntity.lua:875-948, ISBuildingObject.lua:438-480
 lua-field	ISBuildAction: item, character, x, y, z, Type=="ISBuildAction"	BA:660,955,980-1016; ISBuildAction.lua:257-266
 lua-field	action.Type "ISPathFindAction"/"ISWalkToTimedAction", .character	BA:741,1231,1255; shared/ISBaseObject.lua:13 (derive sets Type)
 lua-field	ISBuildPanel: player, logic	BA:681-684; ISBuildPanel.lua:454,462
@@ -156,6 +157,8 @@ assume	DoTileBuilding calls tryBuild on each click when isValid passes; isValid 
 assume	ISWidgetBuildControl:prerender resets buttonCraft.enable every frame	BA:1197-1209; ISWidgetBuildControl.lua:164-172
 assume	ISWidgetInput:updateValues runs every frame and resets primary.icon.backgroundColor.a	UI:87-111; ISWidgetInput.lua:156,500,577
 assume	ISCraftInventoryPanel copies drawListItem into doDrawItem at createChildren, so the wrap must be installed before any panel exists	UI:139-140; ISCraftInventoryPanel.lua:102
+assume	ISBuildingObject:tryBuild equips firstItem via getFirstTypeEvalArgRecurse(firstItem, firstPredicate, firstArg) when firstPredicate is set; without it getItemFromType may pick a broken tool	ISBuildingObject.lua:238-262
+assume	tools: InventoryItem:isBroken; in MP the server was seen building with a broken hammer (11-06 console.txt), so the client gates scheduler builds on canPerformCurrentRecipe at start	BA hookBuildAction, F:usable
 assume	build action identified by a.Type == "ISBuildAction" (a modded subclass wouldn't match)	BA:660
 assume	vanilla walks to furniture with walkAdjSquares: next to a tile, diagonals allowed, never on it; the mod picks that square itself (T.standsNextTo) and the build action accepts it	BA:690-730, T:348; ISBuildIsoEntity.lua:26-29, luautils.lua:398 (diagonal stand tested in T7)
 assume	stackable = first tile sprite has IsStackable; stacked on the same square, cursor/ghost raised by getTotalTableHeight, limit total + Surface <= 96; create sets RenderYOffset	BA:290-370; ISBuildIsoEntity.lua:95-97,220,336-339,672-676, ISMoveableSpriteProps.lua:1772-1774

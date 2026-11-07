@@ -214,13 +214,20 @@ end
 
 -- ---------------------------------------------------------------- build entities
 
+-- a tool the build can use: not broken (vanilla's own build check rejects broken tools,
+-- but vanilla equips the right-hand tool by type and may pick a broken one)
+local function usableTool(item)
+    return ISBuildIsoEntity.predicateMaterial(item) and not item:isBroken()
+end
+BuildAhead.usableTool = usableTool
+
 local function getTool(inputScript, inventory, bans)
     if not inputScript then return nil end
     local entryItems = inputScript:getPossibleInputItems()
     for m = 0, entryItems:size() - 1 do
         local itemType = entryItems:get(m):getFullName()
         if not bans[itemType] then
-            local result = inventory:getAllTypeEvalRecurse(itemType, ISBuildIsoEntity.predicateMaterial)
+            local result = inventory:getAllTypeEvalRecurse(itemType, usableTool)
             if result:size() > 0 then return result:get(0):getFullType() end
         end
     end
@@ -259,7 +266,12 @@ function BuildAhead.describeInputs(logic, data)
         local d = data:getDataForInputScript(inputs:get(i))
         local counts = {}
         for n = 0, (d and d:getAppliedItemsCount() or 0) - 1 do
-            local t = d:getAppliedItem(n):getFullType()
+            local it = d:getAppliedItem(n)
+            local t = it:getFullType()
+            -- a tool input: its condition (a broken one must never be used)
+            if inputs:get(i):isKeep() then
+                t = t .. "(cond " .. it:getCondition() .. (it:isBroken() and " broken" or "") .. ")"
+            end
             counts[t] = (counts[t] or 0) + 1
         end
         for t, c in pairs(counts) do parts[#parts + 1] = t .. " x" .. c end
@@ -281,6 +293,8 @@ local function makeEntity(playerObj, info, nSprite)
     local bans = BuildAhead.getBans(playerObj)
     e.equipBothHandItem = getTool(recipe:getToolBoth(), inv, bans)
     e.firstItem = getTool(recipe:getToolRight(), inv, bans)
+    -- ISBuildingObject.tryBuild equips firstItem through this predicate when set
+    if e.firstItem then e.firstPredicate = usableTool end
     e.secondItem = getTool(recipe:getToolLeft(), inv, bans)
     e.buildAheadSite = true
     e:getSprite() -- applies nSprite (north/west)
@@ -1217,12 +1231,39 @@ local function hookBuildAction()
                 -- startCraftAction copied the inputs chosen before walking
                 logic:stopCraftAction()
                 logic:startCraftAction(self)
+                local hand = playerObj:getPrimaryHandItem()
                 log("build start: inputs", BuildAhead.describeInputs(logic), "player at",
-                    math.floor(playerObj:getX()), math.floor(playerObj:getY()))
+                    math.floor(playerObj:getX()), math.floor(playerObj:getY()),
+                    "hand", hand and (hand:getFullType() .. " cond " .. hand:getCondition()
+                        .. (hand:isBroken() and " broken" or "")) or "-",
+                    "can", tostring(logic:canPerformCurrentRecipe()))
+                -- the build's own check, where the build happens: in multiplayer the server
+                -- was seen to build with a broken hammer, so a build it rejects is not started
+                if not logic:canPerformCurrentRecipe() then self.buildAheadNoGo = true end
             end)
             if not ok then log("build start refresh error", err) end
         end
         return origStart(self, ...)
+    end
+
+    -- a scheduler build its own check rejected at start: stop it on the next update
+    local origIsValid = ISBuildAction.isValid
+    function ISBuildAction:isValid(...)
+        if self.buildAheadNoGo then
+            if not self.buildAheadNoGoLogged then
+                self.buildAheadNoGoLogged = true
+                local why = ""
+                pcall(function() why = table.concat(missingMaterials(self.item.buildPanelLogic), ", ") end)
+                log("build rejected at start: lacks", why, "at", self.x, self.y, self.z)
+                -- skip the site and go on with the next one (a site whose tool broke
+                -- waits for another tool: the plan no longer counts the broken one)
+                local objName = self.item.objectInfo and self.item.objectInfo:getName()
+                local site = objName and siteOn(objName, self.x, self.y, self.z, self.item.buildAheadLevel)
+                if site then BuildAhead.onFetchFailed(self.character, site, "rejected at start") end
+            end
+            return false
+        end
+        return origIsValid(self, ...)
     end
 
     -- a scheduler build that ends without being performed (rejected, interrupted):

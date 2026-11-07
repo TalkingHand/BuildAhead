@@ -227,6 +227,9 @@ end
 local function usable(s, item, playerObj, bans)
     local t = item:getFullType()
     if not s.types[t] or bans[t] or not ISBuildIsoEntity.predicateMaterial(item) then return false end
+    -- a broken tool does not count: the build rejects it, and a plan that counts it
+    -- would neither fetch another one nor stop the chain
+    if s.tool and item:isBroken() then return false end
     local ok, can = pcall(function() return s.input:canUseItem(item, playerObj) end)
     return not ok or can
 end
