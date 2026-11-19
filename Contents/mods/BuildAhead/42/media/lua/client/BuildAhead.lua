@@ -679,7 +679,7 @@ local function isWallLike(e)
                 if name then
                     local props = getSprite(name):getProperties()
                     for _, t in ipairs({ "WALL_N", "WALL_W", "WALL_N_TRANS", "WALL_W_TRANS", "WINDOW_N", "WINDOW_W",
-                        "DOOR_WALL_N", "DOOR_WALL_W" }) do
+                        "WINDOW_FRAME_N", "WINDOW_FRAME_W", "DOOR_WALL_N", "DOOR_WALL_W" }) do
                         if IsoPropertyType[t] and props:has(IsoPropertyType[t]) then return true end
                     end
                     -- a door in a frame stands on the frame's edge too

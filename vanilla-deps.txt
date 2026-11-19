@@ -1,5 +1,5 @@
 # BuildAhead: vanilla dependencies (format: _guide/README.md "9. 게임 업데이트 대응")
-# checked: 42.21.0
+# checked: 42.22.2 (pzt run 2026-11-10, 275 PASS)
 # Java methods below are also listed in tools/java-calls.json: python -I ../_tools/jcheck.py <jar> tools/java-calls.json
 # (existence only; behaviour is what the assume lines are for)
 #
@@ -115,7 +115,7 @@ data	type name strings "ISBuildAction", "ISPathFindAction", "ISWalkToTimedAction
 
 ## Assumptions
 assume	isValid returns false while blockBuild is set; build panel sets blockBuild = not canPerform or craft in progress	BA:13-16,917; ISBuildIsoEntity.lua:436, ISBuildPanel.lua:323-332
-assume	render() sets isWallLike only while drawing the cursor; reset sets false. Mod copies render's property list	BA:535-539; ISBuildIsoEntity.lua:86-90, ISBuildingObject.lua:457
+assume	render() sets isWallLike only while drawing the cursor; reset sets false. Mod copies render's property list (42.22 added WINDOW_FRAME_N/W; copied)	BA:535-539; ISBuildIsoEntity.lua:86-90, ISBuildingObject.lua:457
 assume	new() sets dragNilAfterPlace=true; tryBuild then setDrag(nil)	BA:253-256; ISBuildIsoEntity.lua:911, ISBuildingObject.lua:209
 assume	tryBuild needs self.player (normally set by setDrag, Java, unverified)	BA:252; ISBuildingObject.lua:179
 assume	tryBuild hands a copyTable copy to ISBuildAction (custom fields buildAheadSite/Stand travel with it) and calls startCraftAction before walkTo	BA:727; ISBuildingObject.lua:194-206
