@@ -1,0 +1,9 @@
+{
+    "Sandbox_BuildAhead": "Build Ahead",
+    "Sandbox_BuildAhead_FetchRange": "Material search range",
+    "Sandbox_BuildAhead_FetchRange_tooltip": "How many tiles around a planned build are searched for missing materials (floor, containers, corpses, car trunks), on the build's level. Larger ranges find more but cost a little more time when many builds are planned. Squares further than about 60 tiles from you are not loaded and never searched.",
+    "Sandbox_BuildAhead_OpenPacks": "Open packed materials",
+    "Sandbox_BuildAhead_OpenPacks_tooltip": "When a planned build needs nails or screws and only a box of them is found, take the box and open it (as a double-click on it does). The build uses only what it needs; the rest stays in your inventory.",
+    "Sandbox_BuildAhead_DragBuild": "Drag to plan floors and walls",
+    "Sandbox_BuildAhead_DragBuild_tooltip": "With a floor or wall in the build cursor, press on a square and drag: a floor fills the rectangle, a wall runs in a line along the drag (dragging east-west makes north walls, north-south west walls). Every square becomes a planned build when you let go. Off: dragging turns the object, as in vanilla."
+}

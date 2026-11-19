@@ -10,5 +10,6 @@
     "IGUI_BuildAhead_NeedSkill": "필요 기술: %1",
     "IGUI_BuildAhead_Blocked": "이 자리에는 지을 수 없음",
     "IGUI_BuildAhead_Trap": "지으면 안에 갇히게 됨",
-    "IGUI_BuildAhead_MayTrap": "(갇힐 수 있음)"
+    "IGUI_BuildAhead_MayTrap": "(갇힐 수 있음)",
+    "IGUI_BuildAhead_PlannedRange": "건설 예정 %1곳 추가"
 }

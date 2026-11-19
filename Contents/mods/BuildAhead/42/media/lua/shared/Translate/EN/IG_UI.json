@@ -10,5 +10,6 @@
     "IGUI_BuildAhead_NeedSkill": "Needs %1",
     "IGUI_BuildAhead_Blocked": "Cannot build here",
     "IGUI_BuildAhead_Trap": "Building this would wall you in",
-    "IGUI_BuildAhead_MayTrap": "(may trap you)"
+    "IGUI_BuildAhead_MayTrap": "(may trap you)",
+    "IGUI_BuildAhead_PlannedRange": "Planned %1 builds"
 }

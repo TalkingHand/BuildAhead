@@ -16,7 +16,7 @@
 "CraftRecipeManager": ["hasPlayerRequiredSkill"],
 "RequiredSkill": ["getPerk","getLevel"],
 "Perk": ["getName"],
-"IsoCell": ["getGridSquare"],
+"IsoCell": ["getGridSquare","createNewGridSquare"],
 "IsoGridSquare": ["getX","getY","getZ","getWorldObjects","getObjects","getDeadBodys","getVehicleContainer","canReachTo","TreatAsSolidFloor","isBlockedTo","getTotalWeightOfItemsOnFloor","isFree","HasStairs","isDoorTo","isWindowTo","isHoppableTo","getWindowFrameTo"],
 "IsoObject": ["getContainerCount","getContainerByIndex","getSquare"],
 "IsoThumpable": ["isLockedToCharacter"],
@@ -29,9 +29,11 @@
 "PropertyContainer": ["has","getFlagsList"],
 "FaceInfo": ["getWidth","getHeight","getzLayers","getTileInfo"],
 "TileInfo": ["getSpriteName","isBlocking"],
-"ScriptManager": ["getItem"],
+"ScriptManager": ["getItem","getCraftRecipe","FindItem"],
 "TextManager": ["MeasureStringX","getFontHeight"],
 "SoundManager": ["playUISound"],
 "SafeHouse": ["isSafehouseAllowLoot"],
-"GlobalObject": ["getSpecificPlayer","isClient","isServer","sendClientCommand","sendServerCommand","getGameTime","getCell","getSprite","getTimestampMs","getText","ZombRand","ZombRandFloat","getScriptManager","getTextManager","getSoundManager"]
+"GlobalObject": ["getSpecificPlayer","isClient","isServer","sendClientCommand","sendServerCommand","getGameTime","getCell","getSprite","getTimestampMs","getText","ZombRand","ZombRandFloat","getScriptManager","getTextManager","getSoundManager","getWorld"],
+"IsoWorld": ["isValidSquare"],
+"SpriteConfigScript": ["getOnIsValid"]
 }

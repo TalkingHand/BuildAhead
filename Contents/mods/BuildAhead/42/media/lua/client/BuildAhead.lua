@@ -22,7 +22,11 @@
 --     player stands when the build starts, not where the site was picked.
 --
 -- Stage 2 (BuildAhead_Fetch.lua): materials that are not at hand are fetched
--- from up to RANGE tiles around the site and dropped where the player builds.
+-- from up to BuildAheadFetch.RANGE tiles around the site (sandbox, default 40)
+-- and dropped where the player builds; packs (a box of nails) are opened.
+--
+-- Floors and walls can be planned over a range: press, drag, release (see
+-- "drag to plan a range"; ISBuildIsoEntity:rotateMouse is wrapped).
 --
 -- Self-enclosure (BuildAhead_Trap.lua): before a site is started, the result is
 -- simulated; if building it from where the player would stand walls the player
@@ -525,9 +529,11 @@ local function canGather(playerObj, site)
         frameBudget.gather = frameBudget.gather - 1
     end
     c.gatherAt = t
-    -- a scan shared between nearby sites only for the ghosts; the scheduler and the
-    -- reasons shown on a click look afresh
-    local ok, plan, missing = pcall(BuildAhead.fetchPlan, playerObj, site, nil, nil, frameBudget ~= nil)
+    -- the scan is shared between sites: for the ghosts, blocks scanned in the last 2 s;
+    -- for the scheduler and the reasons shown on a click, blocks scanned in this tick
+    -- (with a 40-tile range a fresh scan per site would freeze the choice among many
+    -- sites). The fetch that starts scans afresh.
+    local ok, plan, missing = pcall(BuildAhead.fetchPlan, playerObj, site, nil, nil, frameBudget ~= nil or "tick")
     if not ok then log("fetch plan error", plan) end
     c.gather = ok and plan ~= nil
     c.gatherMissing = ok and missing or nil
@@ -1140,9 +1146,201 @@ local function onPlannedStage(cursor, square)
 end
 BuildAhead.onPlannedStage = onPlannedStage
 
+-- ---------------------------------------------------------------- drag to plan a range
+
+-- Floors and walls: press on a square, drag, release. Vanilla fixes the cursor on the
+-- pressed square while the button is down and turns the object toward the mouse
+-- (ISBuildingObject:rotateMouse, called from DoTileBuilding each frame with the square
+-- under the mouse); for these objects the drag marks a range instead: a floor fills
+-- the rectangle between the two squares, a wall runs in a straight line from the
+-- pressed square along the drag (along x: north walls, along y: west walls). On
+-- release every valid square of the range becomes a planned site.
+BuildAhead.DRAG_ENABLED = true -- sandbox BuildAhead.DragBuild
+BuildAhead.DRAG_MAX = 100      -- squares one drag plans at most (a 10x10 floor)
+BuildAhead.DRAG_LINE_MAX = 40  -- squares along one side (a wall line, a floor's side)
+BuildAhead.DRAG_VALID_MS = 250 -- how long the range's validity is reused while dragging
+
+-- "floor", "wall" or false (kept on the cursor; doors and door frames are placed one by one)
+local function dragKind(e)
+    if e.buildAheadDragKind ~= nil then return e.buildAheadDragKind end
+    local kind = false
+    pcall(function()
+        local face = e:getFace()
+        if not face or face:getWidth() ~= 1 or face:getHeight() ~= 1 or face:getzLayers() ~= 1 then return end
+        local ti = face:getTileInfo(0, 0, 0)
+        local name = ti and ti:getSpriteName()
+        local props = name and getSprite(name) and getSprite(name):getProperties()
+        if not props then return end
+        if props:has("IsStackable") then return end
+        for _, t in ipairs({ "DOOR_WALL_N", "DOOR_WALL_W" }) do
+            if IsoPropertyType[t] and props:has(IsoPropertyType[t]) then return end
+        end
+        for _, f in ipairs({ "doorN", "doorW" }) do
+            if IsoFlagType[f] and props:has(IsoFlagType[f]) then return end
+        end
+        if IsoFlagType.solidfloor and props:has(IsoFlagType.solidfloor) then
+            kind = "floor"
+            return
+        end
+        for _, t in ipairs({ "WALL_N", "WALL_W", "WALL_N_TRANS", "WALL_W_TRANS" }) do
+            if IsoPropertyType[t] and props:has(IsoPropertyType[t]) then
+                kind = "wall"
+                return
+            end
+        end
+        for _, f in ipairs({ "WallN", "WallW", "WallNTrans", "WallWTrans" }) do
+            if IsoFlagType[f] and props:has(IsoFlagType[f]) then
+                kind = "wall"
+                return
+            end
+        end
+        -- vanilla floors check their square with BuildRecipeCode.floor.OnIsValid
+        local test = e.objectInfo:getScript():getOnIsValid()
+        if test and string.find(tostring(test), ".floor.", 1, true) then kind = "floor" end
+    end)
+    e.buildAheadDragKind = kind
+    return kind
+end
+BuildAhead.dragKind = dragKind
+
+-- the squares of the cursor's drag, nearest the pressed square first ({ x, y, z }), or nil
+function BuildAhead.dragSquares(cursor)
+    local d = cursor.buildAheadDrag
+    if not d then return nil end
+    local out = {}
+    local function step(a, b) return b >= a and 1 or -1 end
+    local maxSide = BuildAhead.DRAG_LINE_MAX
+    if d.kind == "floor" then
+        local sx, sy = step(d.sx, d.mx), step(d.sy, d.my)
+        local w = math.min(math.abs(d.mx - d.sx) + 1, maxSide)
+        local h = math.min(math.abs(d.my - d.sy) + 1, maxSide, math.max(1, math.floor(BuildAhead.DRAG_MAX / w)))
+        for i = 0, w - 1 do
+            for j = 0, h - 1 do
+                out[#out + 1] = { x = d.sx + i * sx, y = d.sy + j * sy, z = d.z, r = math.max(i, j) }
+            end
+        end
+        table.sort(out, function(a, b) return a.r < b.r end)
+    elseif cursor.north then
+        local s = step(d.sx, d.mx)
+        for i = 0, math.min(math.abs(d.mx - d.sx), maxSide - 1) do
+            out[#out + 1] = { x = d.sx + i * s, y = d.sy, z = d.z }
+        end
+    else
+        local s = step(d.sy, d.my)
+        for i = 0, math.min(math.abs(d.my - d.sy), maxSide - 1) do
+            out[#out + 1] = { x = d.sx, y = d.sy + i * s, z = d.z }
+        end
+    end
+    return out
+end
+
+local cursorValid -- the cursor's isValid for one square (set in hookCursor)
+
+-- the drag's squares with their validity: { x, y, z, sq, valid }, reused for a moment
+local function dragValidity(cursor)
+    local d = cursor.buildAheadDrag
+    local key = d.sx .. "," .. d.sy .. "," .. d.mx .. "," .. d.my .. "," .. tostring(cursor.nSprite)
+    local t = getTimestampMs()
+    local c = cursor.buildAheadDragValid
+    if c and c.key == key and t - c.at < BuildAhead.DRAG_VALID_MS then return c.list end
+    local list = {}
+    for _, q in ipairs(BuildAhead.dragSquares(cursor) or {}) do
+        local s = getCell():getGridSquare(q.x, q.y, q.z)
+        -- as DoTileBuilding does for the square under the mouse (upper floors have none yet)
+        if not s and getWorld():isValidSquare(q.x, q.y, q.z) then
+            s = getCell():createNewGridSquare(q.x, q.y, q.z, true)
+        end
+        local ok, v = pcall(cursorValid, cursor, s)
+        list[#list + 1] = { x = q.x, y = q.y, z = q.z, sq = s, valid = ok and v == true }
+    end
+    cursor.buildAheadDragValid = { key = key, at = t, list = list }
+    return list
+end
+BuildAhead.dragValidity = dragValidity
+
+local function clearDrag(cursor)
+    cursor.buildAheadDrag = nil
+    cursor.buildAheadDragValid = nil
+end
+
+-- while the button is down (x, y: the square under the mouse): a range for floors and
+-- walls, else vanilla's turn toward the mouse. true: handled here.
+local function dragTo(cursor, x, y)
+    local kind = BuildAhead.DRAG_ENABLED and cursor.square and plansSites(cursor) and dragKind(cursor)
+    if not kind then
+        clearDrag(cursor)
+        return false
+    end
+    local sx, sy = cursor.square:getX(), cursor.square:getY()
+    x, y = math.floor(x), math.floor(y)
+    if x == sx and y == sy then
+        -- back on the pressed square: one site, as a plain click
+        clearDrag(cursor)
+        return true
+    end
+    if kind == "wall" then
+        -- the line's axis sets the wall's side; an object with one side keeps it
+        local want = math.abs(x - sx) >= math.abs(y - sy) and 2 or 1
+        if cursor.nSprite ~= want then
+            cursor.nSprite = want
+            cursor:getFace() -- falls back to a side the object has
+        end
+        cursor:getSprite() -- sets cursor.north from nSprite
+    end
+    cursor.buildAheadDrag = { sx = sx, sy = sy, z = cursor.square:getZ(), mx = x, my = y, kind = kind }
+    return true
+end
+BuildAhead.dragTo = dragTo
+
+-- the drag's ghosts (the cursor is fixed on the pressed square meanwhile): white where
+-- the object can be placed, red where not, as vanilla's cursor
+local function renderDrag(cursor)
+    local face = cursor:getFace()
+    if not face then return end
+    for _, q in ipairs(dragValidity(cursor)) do
+        local r, g, b = 1.0, 1.0, 1.0
+        if not q.valid then r, g, b = 0.65, 0.2, 0.2 end
+        local ti = face:getTileInfo(0, 0, 0)
+        local name = ti and ti:getSpriteName()
+        local sprite = name and (cursor.spriteCache and cursor.spriteCache[name] or getSprite(name))
+        if sprite then sprite:RenderGhostTileColor(q.x, q.y, q.z, r, g, b, 0.6) end
+    end
+end
+
+-- release: a site on every valid square of the range, one note for all of them
+local function planRange(cursor, list)
+    local playerObj = cursor.character
+    local name = cursor.objectInfo:getName()
+    local n, first, skippedSquares = 0, nil, 0
+    for _, q in ipairs(list) do
+        if q.valid and not sameAsCurrentBuild(playerObj, name, q.x, q.y, q.z) then
+            local site = BuildAhead.addSite(name, q.x, q.y, q.z, cursor.nSprite, nil)
+            if site then
+                n = n + 1
+                first = first or site
+            end
+        else
+            skippedSquares = skippedSquares + 1
+        end
+    end
+    log("drag planned", n, "sites of", name, "from", list[1] and (list[1].x .. "," .. list[1].y) or "-",
+        "squares", #list, "not valid", skippedSquares, "nSprite", cursor.nSprite)
+    local reason = first and BuildAhead.cannotBuildReason(playerObj, first)
+    if reason == getText("IGUI_BuildAhead_Blocked") and onPlannedStage(cursor, siteSquare(first)) then reason = nil end
+    local text = getText("IGUI_BuildAhead_PlannedRange", n)
+    if reason then text = text .. " - " .. reason end
+    playerObj:setHaloNote(text, 255, 220, 80, 300)
+    if n > 0 and not BuildAhead.isBusy(playerObj) then
+        BuildAhead.schedule(playerObj, math.floor(playerObj:getX()), math.floor(playerObj:getY()),
+            math.floor(playerObj:getZ()), BuildAhead.CLICK_WAIT_MS)
+    end
+    return n
+end
+BuildAhead.planRange = planRange
+
 local function hookCursor()
     local origIsValid = ISBuildIsoEntity.isValid
-    function ISBuildIsoEntity:isValid(square, ...)
+    cursorValid = function(self, square, ...)
         local planning = plansSites(self)
         -- a site the player lacks the skill for would never be built: stay red, as in vanilla
         if planning and not hasSkills(self.character, cursorRecipe(self)) then
@@ -1172,6 +1370,37 @@ local function hookCursor()
         end
         return valid
     end
+    function ISBuildIsoEntity:isValid(square, ...)
+        local d = self.buildAheadDrag
+        if d and square and square:getX() == d.sx and square:getY() == d.sy and square:getZ() == d.z
+            and plansSites(self) then
+            -- the release plans the whole range: valid when any square of it is
+            for _, q in ipairs(dragValidity(self)) do
+                if q.valid then return true end
+            end
+            return false
+        end
+        return cursorValid(self, square, ...)
+    end
+
+    -- drag errors repeat every frame while the button is down: log only the first few
+    local dragErrors = 0
+    local function logDragError(what, err)
+        dragErrors = dragErrors + 1
+        if dragErrors <= 5 then log(what, err) end
+    end
+
+    -- while the build button is down: a range for floors and walls (see dragTo)
+    local origRotateMouse = ISBuildIsoEntity.rotateMouse
+    function ISBuildIsoEntity:rotateMouse(x, y, ...)
+        local ok, handled = pcall(dragTo, self, x, y)
+        if not ok then
+            logDragError("drag error", handled)
+            clearDrag(self)
+        end
+        if ok and handled then return end
+        return origRotateMouse(self, x, y, ...)
+    end
 
     -- the cursor of a stackable object is drawn on top of the levels planned on its
     -- square (vanilla raises it by the real stack's height only)
@@ -1184,6 +1413,16 @@ local function hookCursor()
     end
     local origRender = ISBuildIsoEntity.render
     function ISBuildIsoEntity:render(x, y, z, square, ...)
+        if self.buildAheadDrag then
+            -- the button went up without a build (DoTileBuilding: no isLeftDown, no build)
+            if not self.isLeftDown and not self.build then
+                clearDrag(self)
+            elseif plansSites(self) then
+                local ok, err = pcall(renderDrag, self)
+                if ok then return end
+                logDragError("drag render error", err)
+            end
+        end
         if square and plansSites(self) and stackInfo(self) then
             local h = plannedHeight(self.character, square:getX(), square:getY(), square:getZ())
             if h > 0 then
@@ -1203,7 +1442,18 @@ local function hookCursor()
             if not hasSkills(self.character, cursorRecipe(self)) then
                 local skills = missingSkills(self.character, { name = self.objectInfo:getName() })
                 self.character:setHaloNote(getText("IGUI_BuildAhead_NeedSkill", table.concat(skills, ", ")), 255, 100, 100, 300)
+                clearDrag(self)
                 return
+            end
+            if self.buildAheadDrag then
+                self.buildAheadDragValid = nil -- checked afresh on release
+                local ok, list = pcall(dragValidity, self)
+                clearDrag(self)
+                if ok then
+                    planRange(self, list)
+                    return
+                end
+                logDragError("drag error", list)
             end
             onCursorClick(self, x, y, z)
             return
@@ -1410,6 +1660,7 @@ local function onPostRender()
     local px, py = playerObj:getX(), playerObj:getY()
     local far = (BuildAhead.RANGE * 2) ^ 2
     frameBudget = { gather = BuildAhead.GATHER_PER_FRAME, states = BuildAhead.STATES_PER_FRAME }
+    BuildAheadFetch.scanBudget = BuildAheadFetch.SCAN_BLOCKS_PER_FRAME
     -- round robin: the sites the budget did not reach this frame come first next frame
     local n = #sites
     BuildAhead.renderStart = ((BuildAhead.renderStart or 0) % n) + 1
@@ -1424,6 +1675,7 @@ local function onPostRender()
         end
     end
     frameBudget = nil
+    BuildAheadFetch.scanBudget = nil
 end
 
 -- ---------------------------------------------------------------- context menu
@@ -1606,7 +1858,16 @@ local function installHooks()
     if ISPathFindAction and ISWalkToTimedAction then hookWalks() end
 end
 
+local function applySandbox()
+    local sv = SandboxVars and SandboxVars.BuildAhead
+    if sv and sv.DragBuild ~= nil then BuildAhead.DRAG_ENABLED = sv.DragBuild == true end
+    log("drag to plan a range", tostring(BuildAhead.DRAG_ENABLED))
+    BuildAheadFetch.applySandbox()
+end
+BuildAhead.applySandbox = applySandbox
+
 local function onGameStart()
+    pcall(applySandbox)
     installHooks()
     if isClient() then
         ModData.request(BuildAheadSites.KEY)

@@ -1352,6 +1352,8 @@ function BuildAheadTest.start()
         return
     end
     T.started = true
+    -- written for 1.0.x: the 20-tile search, no pack opening, no drag ranges (BuildAhead_Test4 covers those)
+    BuildAheadFetch.RANGE, BuildAheadFetch.OPEN_PACKS, BuildAhead.DRAG_ENABLED = 20, false, false
     log("start")
 end
 

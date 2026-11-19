@@ -1320,6 +1320,8 @@ function BuildAheadTest2.start(only)
     end
     R.phase = "run"
     hookPerform()
+    -- written for 1.0.x: the 20-tile search, no pack opening, no drag ranges (BuildAhead_Test4 covers those)
+    BuildAheadFetch.RANGE, BuildAheadFetch.OPEN_PACKS, BuildAhead.DRAG_ENABLED = 20, false, false
     setupPlayer()
     R.cheat = ISBuildMenu.cheat
     ISBuildMenu.cheat = false
@@ -1348,6 +1350,8 @@ end
 -- the reload run (second `pzt run KEEP_SAVE=1`): what part 1 left must be there
 function BuildAheadTest2.reloadStart()
     R.phase = "reload"
+    -- written for 1.0.x: the 20-tile search, no pack opening, no drag ranges (BuildAhead_Test4 covers those)
+    BuildAheadFetch.RANGE, BuildAheadFetch.OPEN_PACKS, BuildAhead.DRAG_ENABLED = 20, false, false
     R.cheat = ISBuildMenu.cheat
     R.list = { { "T6 persistence (reload)", reloadCheck } }
     log("reload start")

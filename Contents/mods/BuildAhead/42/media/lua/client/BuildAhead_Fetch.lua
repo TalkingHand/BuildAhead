@@ -24,6 +24,12 @@
 -- goes back there when the chain ends, and the weapon held before the chain
 -- started is equipped again.
 --
+-- Packed materials (F.PACKS: a box of nails, a box of screws): a box counts as
+-- the loose items it holds. A box the plan uses is taken into the inventory like
+-- any material and opened there with vanilla's own recipe (the box's double-click
+-- recipe, ISInventoryPaneContextMenu.OnNewCraft) before the build; the build takes
+-- only what it needs and the rest stays loose in the inventory for the next sites.
+--
 -- All steps are vanilla timed actions; the job polls the action queue on each
 -- tick and checks what each step really did once the queue is empty.
 
@@ -32,7 +38,9 @@ require "BuildAhead_Inputs"
 BuildAheadFetch = BuildAheadFetch or {}
 local F = BuildAheadFetch
 
-F.RANGE = 20                 -- tiles from the site
+F.RANGE = 40                 -- tiles from the site (sandbox BuildAhead.FetchRange)
+F.RANGE_MIN, F.RANGE_MAX = 5, 60 -- squares further than about 60 from the player are not loaded
+F.OPEN_PACKS = true          -- open packed materials (sandbox BuildAhead.OpenPacks)
 F.CHECK_EVERY_MS = 2000      -- how long a "can be gathered" answer is reused (ghosts, site choice)
 F.BLACKLIST_MS = 5 * 60000   -- a source that failed is left out this long
 F.SETTLE_MS = 400            -- after the queue empties: let multiplayer item moves arrive
@@ -43,13 +51,80 @@ F.FLOOR_CAP = 50             -- ISDropWorldItemAction refuses more weight per sq
 F.job = nil      -- the running fetch (or tool return) job
 F.chain = nil    -- { player, primary, secondary, borrowed = { { id, src } } }
 F.blacklist = {} -- source key -> time it may be used again
-F.stats = { drops = 0, takes = 0, rehandled = 0 } -- drops queued, items taken, takes from where the site is built from (tests)
+F.stats = { drops = 0, takes = 0, rehandled = 0, opens = 0 } -- drops queued, items taken, takes from where the site is built from, packs opened (tests)
 
 local function log(...)
     BuildAhead.log("fetch", ...)
 end
 
 local function now() return getTimestampMs() end
+
+-- the sandbox options (read on game start)
+function F.applySandbox()
+    local sv = SandboxVars and SandboxVars.BuildAhead
+    local r = sv and tonumber(sv.FetchRange)
+    if r then F.RANGE = math.max(F.RANGE_MIN, math.min(F.RANGE_MAX, math.floor(r))) end
+    if sv and sv.OpenPacks ~= nil then F.OPEN_PACKS = sv.OpenPacks == true end
+    log("range", F.RANGE, "open packs", tostring(F.OPEN_PACKS))
+end
+
+-- ---------------------------------------------------------------- packs
+
+-- Packed materials, from vanilla's recipes (scripts/generated/recipes/recipes_packing.txt):
+-- the recipe that opens the pack and how many loose items it gives. Only item-count
+-- materials (not drainable ones such as duct tape, whose amount is in uses).
+-- Cartons (12 boxes) are not opened: that would take two recipes.
+F.PACKS = {
+    { item = "Base.Nails", pack = "Base.NailsBox", recipe = "OpenBox100", count = 100 },
+    { item = "Base.Screws", pack = "Base.ScrewsBox", recipe = "OpenBox100", count = 100 },
+}
+F.packByType = nil       -- pack full type -> F.PACKS entry, checked against this game's scripts
+F.packFailed = {}        -- pack item id -> time it may be tried again (opening did not work)
+
+function F.packs()
+    if F.packByType then return F.packByType end
+    local out = {}
+    local sm = getScriptManager()
+    for _, p in ipairs(F.PACKS) do
+        local ok, good = pcall(function()
+            return sm:getCraftRecipe(p.recipe) ~= nil and sm:FindItem(p.pack) ~= nil and sm:FindItem(p.item) ~= nil
+        end)
+        if ok and good then
+            out[p.pack] = p
+        else
+            log("pack left out (recipe or item not in this game):", p.pack, p.recipe)
+        end
+    end
+    F.packByType = out
+    return out
+end
+
+-- the F.PACKS entry when `item` is a pack of loose items this input takes (s from F.shortInputs)
+local function packFor(s, item, bans)
+    if not F.OPEN_PACKS or s.tool then return nil end
+    local p = F.packs()[item:getFullType()]
+    if not p or not s.types[p.item] or bans[p.item] or bans[p.pack] then return nil end
+    if not ISBuildIsoEntity.predicateMaterial(item) then return nil end
+    local t = F.packFailed[item:getID()]
+    if t and now() < t then return nil end
+    return p
+end
+F.packFor = packFor
+
+-- the player's inventory or a bag in it (loot-window containers and the floor are not)
+function F.isCarried(playerObj, cont)
+    local inv = playerObj:getInventory()
+    if cont == inv then return true end
+    local it = cont and cont:getContainingItem()
+    return it ~= nil and it:getContainer() == inv
+end
+
+-- what an opened pack leaves over after the input that opened it: { [loose type] = count }
+local function addSpare(spare, s, p)
+    if spare and s.short < 0 then
+        spare[p.item] = (spare[p.item] or 0) - s.short
+    end
+end
 
 function F.isBlacklisted(key)
     local t = F.blacklist[key]
@@ -150,30 +225,70 @@ local function scanBox(playerObj, x0, y0, x1, y1, cz)
     return out
 end
 
-F.SCAN_REUSE_MS = 2000 -- how long a shared scan is reused for "can be gathered" answers
-F.SCAN_MARGIN = 10     -- a shared scan covers this much more around the site, for the sites nearby
-F.stats.scans = 0
-F.scanCache = nil      -- { x0, y0, x1, y1, z, at, list }
+-- The scan is kept per 8x8 block of squares, so sites near each other share
+-- it and a larger range costs only the blocks not scanned a moment ago.
+F.SCAN_REUSE_MS = 2000 -- how long a block's scan is reused for "can be gathered" answers
+F.SCAN_BLOCK = 8       -- squares per side of a cached block
+F.SCAN_KEEP_MS = 10000 -- blocks older than this are dropped from the cache
+F.SCAN_BLOCKS_PER_FRAME = 24 -- while the ghosts are drawn: stale blocks rescanned per frame (the rest wait)
+F.stats.scans = 0      -- blocks scanned
+F.scanCache = nil      -- block key -> { at, list, player } (tests set it to nil to drop it)
+F.scanBudget = nil     -- blocks that may still be rescanned this frame (set while the ghosts are drawn)
+F.sourceFilter = nil   -- tests only: function(src) -> false leaves a source out
+F.tick = 0             -- counts OnTicks (F.update): reuse = "tick" takes blocks scanned in this tick only
+local lastPurge = 0
+
+local function blockSources(playerObj, bx, by, cz, reuse)
+    F.scanCache = F.scanCache or {}
+    local key = bx .. "," .. by .. "," .. cz
+    local c = F.scanCache[key]
+    local t = now()
+    if c and c.player == playerObj and reuse == "tick" then
+        if c.tick == F.tick then return c.list end
+    elseif c and c.player == playerObj and reuse then
+        if t - c.at < F.SCAN_REUSE_MS then return c.list end
+        -- stale: rescanned in a later frame when this one's budget is spent
+        if F.scanBudget then
+            if F.scanBudget <= 0 then return c.list end
+            F.scanBudget = F.scanBudget - 1
+        end
+    end
+    local n = F.SCAN_BLOCK
+    local list = scanBox(playerObj, bx * n, by * n, bx * n + n - 1, by * n + n - 1, cz)
+    F.stats.scans = F.stats.scans + 1
+    F.scanCache[key] = { at = t, tick = F.tick, list = list, player = playerObj }
+    return list
+end
+
+local function purgeScanCache()
+    local t = now()
+    if t - lastPurge < F.SCAN_KEEP_MS or not F.scanCache then return end
+    lastPurge = t
+    for k, c in pairs(F.scanCache) do
+        if t - c.at > F.SCAN_KEEP_MS then F.scanCache[k] = nil end
+    end
+end
 
 -- Every source within RANGE of (cx, cy) on level cz; `exclude` is a square
--- whose 3x3 is at hand already and not searched. reuse: the answer may come
--- from a scan made for a site nearby a moment ago (ghost colours and the choice
--- of the next site, which ask for many sites at once); a fetch that starts
--- always scans afresh.
+-- whose 3x3 is at hand already and not searched. reuse: true, the answer may
+-- come from blocks scanned in the last SCAN_REUSE_MS (ghost colours, which ask
+-- for many sites at once); "tick", from blocks scanned in this tick only (the
+-- choice of the next site among many, the reason shown on a click); nil, a fresh
+-- scan (a fetch that starts).
 function F.scan(playerObj, cx, cy, cz, exclude, reuse)
     local r = F.RANGE
-    local list
-    local c = F.scanCache
-    if reuse and c and c.z == cz and now() - c.at < F.SCAN_REUSE_MS and c.player == playerObj
-        and cx - r >= c.x0 and cx + r <= c.x1 and cy - r >= c.y0 and cy + r <= c.y1 then
-        list = c.list
-    else
-        local m = reuse and F.SCAN_MARGIN or 0
-        local x0, y0, x1, y1 = cx - r - m, cy - r - m, cx + r + m, cy + r + m
-        list = scanBox(playerObj, x0, y0, x1, y1, cz)
-        F.stats.scans = F.stats.scans + 1
-        if reuse then
-            F.scanCache = { x0 = x0, y0 = y0, x1 = x1, y1 = y1, z = cz, at = now(), list = list, player = playerObj }
+    purgeScanCache()
+    local n = F.SCAN_BLOCK
+    local list, seen = {}, {}
+    for bx = math.floor((cx - r) / n), math.floor((cx + r) / n) do
+        for by = math.floor((cy - r) / n), math.floor((cy + r) / n) do
+            for _, src in ipairs(blockSources(playerObj, bx, by, cz, reuse)) do
+                -- a vehicle is listed in every block it stands in
+                if not seen[src.key] then
+                    seen[src.key] = true
+                    list[#list + 1] = src
+                end
+            end
         end
     end
     local out = {}
@@ -182,7 +297,7 @@ function F.scan(playerObj, cx, cy, cz, exclude, reuse)
         local rr = src.kind == "vehicle" and r + 3 or r
         if math.abs(src.x - cx) <= rr and math.abs(src.y - cy) <= rr
             and not (exclude and cz == exclude.z and math.abs(src.x - exclude.x) <= 1 and math.abs(src.y - exclude.y) <= 1)
-            and not F.isBlacklisted(src.key) then
+            and not F.isBlacklisted(src.key) and (not F.sourceFilter or F.sourceFilter(src)) then
             -- a copy: planning marks its sources (distance, reachable)
             local copy = {}
             for k, v in pairs(src) do copy[k] = v end
@@ -244,11 +359,14 @@ end
 -- full, so what is there already is counted here from `base` (the containers
 -- the logic was filled from); `taken` gets the ids counted. all: every input
 -- counts as unsatisfied (the logic is not filled), only `base` is counted.
+-- Packs the player carries (inventory or a bag) count as their loose items:
+-- second value { { item, pack } } (they are opened before the build), third
+-- { [loose type] = count } what they leave over.
 function F.shortInputs(logic, base, bans, playerObj, taken, all)
-    local out = {}
+    local out, opens, spare = {}, {}, {}
     local recipe = logic:getRecipe()
     local inputs = recipe and recipe:getInputs()
-    if not inputs then return out end
+    if not inputs then return out, opens, spare end
     local data = logic:getRecipeData()
     for i = 0, inputs:size() - 1 do
         local input = inputs:get(i)
@@ -277,11 +395,35 @@ function F.shortInputs(logic, base, bans, playerObj, taken, all)
                         end
                     end
                 end
+                -- then packs the player carries
+                if s.short > 0 and F.OPEN_PACKS then
+                    for c = 0, (base and base:size() or 0) - 1 do
+                        local cont = base:get(c)
+                        if F.isCarried(playerObj, cont) then
+                            for packType, p in pairs(F.packs()) do
+                                if s.short <= 0 then break end
+                                if s.types[p.item] then
+                                    local items = cont:getAllTypeEvalRecurse(packType, ISBuildIsoEntity.predicateMaterial)
+                                    for n = 0, items:size() - 1 do
+                                        local item = items:get(n)
+                                        if s.short <= 0 then break end
+                                        if not taken[item:getID()] and packFor(s, item, bans) then
+                                            taken[item:getID()] = true
+                                            s.short = s.short - p.count
+                                            opens[#opens + 1] = { item = item, pack = p }
+                                            addSpare(spare, s, p)
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
                 if s.short > 0 then out[#out + 1] = s end
             end
         end
     end
-    return out
+    return out, opens, spare
 end
 
 local function distSq(playerObj, src)
@@ -316,16 +458,31 @@ F.standOf = standOf
 -- from; what lies in its 3x3 counts as there already and is not fetched.
 -- reuse: see F.scan. A plan comes with { taken, sources, logic } as the third
 -- value (the ids it counted, the sources searched nearest first) for F.planExtra.
+-- Packs (F.PACKS) count as their loose items: a carried one comes as the first entry
+-- (F.CARRIED, nothing to take), a fetched one as a take; both have e.open set and are
+-- opened before the build (tripSteps).
+-- the plan entry for packs the player carries: nothing to take, only to open
+F.CARRIED = { kind = "carried", key = "carried", d = -1 }
+
+-- What to fetch (see above).
 function F.plan(playerObj, logic, bans, cx, cy, cz, atHand, base, reuse)
     local taken = {}
-    local shorts = F.shortInputs(logic, base, bans, playerObj, taken)
-    if #shorts == 0 then return {} end
+    local shorts, opens, spare = F.shortInputs(logic, base, bans, playerObj, taken)
+    local carried = nil
+    if #opens > 0 then
+        carried = { src = F.CARRIED, items = {} }
+        for _, o in ipairs(opens) do table.insert(carried.items, { item = o.item, open = o.pack }) end
+    end
+    if #shorts == 0 then
+        return carried and { carried } or {}, nil, { taken = taken, sources = {}, logic = logic, spare = spare }
+    end
     local stand = standOf(atHand)
     local sources = F.scan(playerObj, cx, cy, cz, nil, reuse)
     -- materials lying where the site is built from: count them first
-    local others = {}
+    local others, near = {}, {}
     for _, src in ipairs(sources) do
         if atHandOf(src, stand) then
+            near[#near + 1] = src
             for _, s in ipairs(shorts) do
                 for _, e in ipairs(F.sourceItems(src)) do
                     if s.short <= 0 then break end
@@ -342,24 +499,38 @@ function F.plan(playerObj, logic, bans, cx, cy, cz, atHand, base, reuse)
     end
     sources = others
     for _, src in ipairs(sources) do src.d = distSq(playerObj, src) end
+    for _, src in ipairs(near) do src.d = distSq(playerObj, src) end
     table.sort(sources, function(a, b) return a.d < b.d end)
     local picks = {}
+    -- packs: false = loose items only, true = packs only (taken into the inventory and opened)
+    local function pickFrom(s, src, packs)
+        for _, e in ipairs(F.sourceItems(src)) do
+            if s.short <= 0 then break end
+            local id = e.item:getID()
+            local p = packs and not taken[id] and packFor(s, e.item, bans)
+            if not taken[id] and (p or (not packs and usable(s, e.item, playerObj, bans))) then
+                if src.reachable == nil then src.reachable = F.reachable(playerObj, src) end
+                if not src.reachable then break end
+                taken[id] = true
+                s.short = s.short - (p and p.count or amountOf(s, e.item))
+                picks[src] = picks[src] or {}
+                table.insert(picks[src], { item = e.item, wo = e.wo, tool = s.tool, open = p or nil })
+                if p then addSpare(spare, s, p) end
+            end
+        end
+    end
     for _, s in ipairs(shorts) do
+        -- a pack lying where the site is built from: picked up there and opened
+        for _, src in ipairs(near) do
+            if s.short <= 0 then break end
+            src.reachable = true
+            pickFrom(s, src, true)
+        end
         for _, src in ipairs(sources) do
             if s.short <= 0 then break end
             if src.reachable ~= false then
-                for _, e in ipairs(F.sourceItems(src)) do
-                    if s.short <= 0 then break end
-                    local id = e.item:getID()
-                    if not taken[id] and usable(s, e.item, playerObj, bans) then
-                        if src.reachable == nil then src.reachable = F.reachable(playerObj, src) end
-                        if not src.reachable then break end
-                        taken[id] = true
-                        s.short = s.short - amountOf(s, e.item)
-                        picks[src] = picks[src] or {}
-                        table.insert(picks[src], { item = e.item, wo = e.wo, tool = s.tool })
-                    end
-                end
+                pickFrom(s, src, false)
+                if s.short > 0 and src.reachable ~= false then pickFrom(s, src, true) end
             end
         end
     end
@@ -372,17 +543,34 @@ function F.plan(playerObj, logic, bans, cx, cy, cz, atHand, base, reuse)
     end
     if #missing > 0 then return nil, missing end
     local plan = {}
+    if carried then plan[#plan + 1] = carried end
+    for _, src in ipairs(near) do
+        if picks[src] then plan[#plan + 1] = { src = src, items = picks[src] } end
+    end
     for _, src in ipairs(sources) do
         if picks[src] then plan[#plan + 1] = { src = src, items = picks[src] } end
     end
-    return plan, nil, { taken = taken, sources = sources, logic = logic }
+    return plan, nil, { taken = taken, sources = sources, logic = logic, spare = spare }
+end
+
+-- the plan opens packs (it is not empty even when nothing is fetched)
+function F.planOpens(plan)
+    for _, entry in ipairs(plan or {}) do
+        for _, e in ipairs(entry.items) do
+            if e.open then return true end
+        end
+    end
+    return false
 end
 
 -- weight of the items a plan takes
 function F.planWeight(plan)
     local w = 0
     for _, entry in ipairs(plan) do
-        for _, e in ipairs(entry.items) do w = w + e.item:getUnequippedWeight() end
+        -- packs the player carries already weigh in the inventory
+        if entry.src.kind ~= "carried" then
+            for _, e in ipairs(entry.items) do w = w + e.item:getUnequippedWeight() end
+        end
     end
     return w
 end
@@ -410,30 +598,50 @@ function F.planExtra(playerObj, plan, info, extras, bans, base, room)
     end)
     local picks = {}
     for _, entry in ipairs(plan) do picks[entry.src] = entry.items end
+    -- loose items an opened pack leaves over (they stay in the inventory)
+    local spare = {}
+    for t, n in pairs(info.spare or {}) do spare[t] = n end
     local added = {}
     for _, x in ipairs(extras) do
         -- counted on a trial table, kept only when the whole site is found and fits
         local trial = setmetatable({}, { __index = taken })
+        local trialSpare = setmetatable({}, { __index = spare })
         local shorts = {}
-        for _, s in ipairs(F.shortInputs(x.logic, base, bans, playerObj, trial, true)) do
+        for _, s in ipairs((F.shortInputs(x.logic, base, bans, playerObj, trial, true))) do
             if not s.tool then shorts[#shorts + 1] = s end
+        end
+        for _, s in ipairs(shorts) do
+            for t in pairs(s.types) do
+                local left = trialSpare[t] or 0
+                if left > 0 and s.short > 0 then
+                    local use = math.min(left, s.short)
+                    trialSpare[t] = left - use
+                    s.short = s.short - use
+                end
+            end
         end
         local stand = standOf(x.stand)
         local mine, w = {}, 0
         for _, src in ipairs(info.sources) do
             local near = atHandOf(src, stand)
             for _, s in ipairs(shorts) do
-                for _, e in ipairs(F.sourceItems(src)) do
-                    if s.short <= 0 then break end
-                    local id = e.item:getID()
-                    if not trial[id] and usable(s, e.item, playerObj, bans) then
-                        if not near and src.reachable == nil then src.reachable = F.reachable(playerObj, src) end
-                        if not near and not src.reachable then break end
-                        trial[id] = true
-                        s.short = s.short - amountOf(s, e.item)
-                        if not near then
-                            w = w + e.item:getUnequippedWeight()
-                            mine[#mine + 1] = { src = src, e = { item = e.item, wo = e.wo, extra = true } }
+                for pass = 1, 2 do
+                    -- loose items first, then packs (brought along unopened: the site's own
+                    -- build opens them, see F.shortInputs)
+                    for _, e in ipairs(F.sourceItems(src)) do
+                        if s.short <= 0 then break end
+                        local id = e.item:getID()
+                        local p = pass == 2 and not near and not trial[id] and packFor(s, e.item, bans)
+                        if not trial[id] and (p or (pass == 1 and usable(s, e.item, playerObj, bans))) then
+                            if not near and src.reachable == nil then src.reachable = F.reachable(playerObj, src) end
+                            if not near and not src.reachable then break end
+                            trial[id] = true
+                            s.short = s.short - (p and p.count or amountOf(s, e.item))
+                            if p and s.short < 0 then trialSpare[p.item] = (trialSpare[p.item] or 0) - s.short end
+                            if not near then
+                                w = w + e.item:getUnequippedWeight()
+                                mine[#mine + 1] = { src = src, e = { item = e.item, wo = e.wo, extra = true } }
+                            end
                         end
                     end
                 end
@@ -449,6 +657,7 @@ function F.planExtra(playerObj, plan, info, extras, bans, base, room)
             break
         end
         for id in pairs(trial) do taken[id] = true end
+        for t, n in pairs(trialSpare) do spare[t] = n end
         for _, m in ipairs(mine) do
             picks[m.src] = picks[m.src] or {}
             table.insert(picks[m.src], m.e)
@@ -456,10 +665,16 @@ function F.planExtra(playerObj, plan, info, extras, bans, base, room)
         room = room - w
         added[#added + 1] = x.site
     end
-    local out = {}
-    for _, src in ipairs(info.sources) do
-        if picks[src] then out[#out + 1] = { src = src, items = picks[src] } end
+    -- nearest first, as F.plan; the carried packs first
+    local out, seen = {}, {}
+    for _, entry in ipairs(plan) do
+        seen[entry.src] = true
+        out[#out + 1] = { src = entry.src, items = picks[entry.src] }
     end
+    for _, src in ipairs(info.sources) do
+        if picks[src] and not seen[src] then out[#out + 1] = { src = src, items = picks[src] } end
+    end
+    table.sort(out, function(a, b) return (a.src.d or 0) < (b.src.d or 0) end)
     return out, added
 end
 
@@ -559,12 +774,18 @@ local function tripSteps(job, plan)
     local inv = p:getInventory()
     local free = roomIn(p, inv)
     local takes, full, count = {}, false, 0
+    local opens = {} -- { { id, pack } }: opened before the walk to the site
+    for _, entry in ipairs(plan) do
+        if entry.src.kind == "carried" then
+            for _, e in ipairs(entry.items) do opens[#opens + 1] = { id = e.item:getID(), pack = e.open } end
+        end
+    end
     for pass = 1, 2 do
         -- extra items only on a trip that holds the whole site
         if pass == 2 and full then break end
         for _, entry in ipairs(plan) do
             for _, e in ipairs(entry.items) do
-                if (pass == 2) == (e.extra == true) then
+                if entry.src.kind ~= "carried" and (pass == 2) == (e.extra == true) then
                     local w = e.item:getUnequippedWeight()
                     if w <= free or count == 0 then
                         free = free - w
@@ -584,7 +805,17 @@ local function tripSteps(job, plan)
     for _, entry in ipairs(plan) do
         if takes[entry] then steps[#steps + 1] = { kind = "take", src = entry.src, items = takes[entry] } end
     end
-    if #steps == 0 then return nil end
+    if #steps == 0 and #opens == 0 then return nil end
+    -- packs taken for this site are opened on its last trip (a trip cut short drops them
+    -- at the site with the rest, and the last trip picks them up again)
+    if not full then
+        for _, entry in ipairs(plan) do
+            for _, e in ipairs(takes[entry] or {}) do
+                if e.open and not e.extra then opens[#opens + 1] = { id = e.item:getID(), pack = e.open } end
+            end
+        end
+    end
+    if #opens > 0 then steps[#steps + 1] = { kind = "open", items = opens } end
     steps[#steps + 1] = { kind = "site" }
     -- another trip follows: leave the load at the site; on the last trip the
     -- build takes it from the inventory
@@ -767,6 +998,51 @@ local function nextStep(job)
     F.advance(job)
 end
 
+-- queue the next pack openings from st.pos on (vanilla's double-click on the pack:
+-- ISInventoryPaneContextMenu.OnNewCraft, which moves a pack out of a bag first);
+-- 0 when none are left
+local function queueOpen(job, st)
+    local p = job.player
+    local n = 0
+    queueOwn(job, function()
+        while (st.pos or 0) < #st.items do
+            st.pos = (st.pos or 0) + 1
+            local o = st.items[st.pos]
+            local item = inInventory(p, o.id)
+            local recipe = item and getScriptManager():getCraftRecipe(o.pack.recipe)
+            if item and recipe then
+                local before = #actionQueue(p)
+                ISInventoryPaneContextMenu.OnNewCraft(item, recipe, p:getPlayerNum(), false)
+                if #actionQueue(p) > before then
+                    n = n + 1
+                    o.queued = true
+                    log("opening", item:getFullType(), "id", o.id)
+                    if oneAtATime() then break end
+                else
+                    log("cannot open", item:getFullType(), "id", o.id)
+                end
+            end
+        end
+    end)
+    return n
+end
+
+-- the packs are gone from the inventory once opened; one that is still there is left
+-- alone for a while (the plan would otherwise count it again and again)
+local function checkOpen(job, st)
+    local opened, left = 0, 0
+    for _, o in ipairs(st.items) do
+        if inInventory(job.player, o.id) then
+            left = left + 1
+            F.packFailed[o.id] = now() + F.BLACKLIST_MS
+        elseif o.queued then
+            opened = opened + 1
+            F.stats.opens = F.stats.opens + 1
+        end
+    end
+    log("opened", opened, "packs", left > 0 and ("(" .. left .. " not opened)") or "")
+end
+
 local function sourceFailed(job, st, why)
     F.blacklistSource(st.src, why)
     job.failures = job.failures + 1
@@ -899,6 +1175,11 @@ function F.advance(job)
         end
         job.siteWalks = nil
         return nextStep(job)
+    elseif st.kind == "open" then
+        job.phase = "open"
+        if queueOpen(job, st) > 0 then return end
+        checkOpen(job, st)
+        return nextStep(job)
     elseif st.kind == "drop" then
         job.phase = "drop"
         if queueDrop(job) > 0 then return end
@@ -953,6 +1234,7 @@ function F.abort(why)
 end
 
 function F.update()
+    F.tick = F.tick + 1
     local job = F.job
     if not job then return end
     local p = job.player

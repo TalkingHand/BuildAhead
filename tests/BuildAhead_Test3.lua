@@ -460,6 +460,8 @@ function BuildAheadTest3.start(only)
     end
     R.phase = "run"
     hookActions()
+    -- written for 1.0.x: the 20-tile search, no pack opening, no drag ranges (BuildAhead_Test4 covers those)
+    BuildAheadFetch.RANGE, BuildAheadFetch.OPEN_PACKS, BuildAhead.DRAG_ENABLED = 20, false, false
     setupPlayer()
     -- vanilla's build walks and checks as in a normal game (-debug turns the cheat on)
     R.cheat = ISBuildMenu.cheat

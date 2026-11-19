@@ -7,3 +7,5 @@ pzt-env/
 mpenv/
 # test save (copied from a personal game)
 tests/save/
+# pzt launch plan (pz_guard hook)
+.pzt_plan.md

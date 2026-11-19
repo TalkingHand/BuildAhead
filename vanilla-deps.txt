@@ -1,5 +1,5 @@
 # BuildAhead: vanilla dependencies (format: _guide/README.md "9. 게임 업데이트 대응")
-# checked: 42.22.2 (pzt run 2026-11-10, 275 PASS)
+# checked: 42.22.2 (pzt run 2026-11-20, parts 1-4, 332 PASS)
 # Java methods below are also listed in tools/java-calls.json: python -I ../_tools/jcheck.py <jar> tools/java-calls.json
 # (existence only; behaviour is what the assume lines are for)
 #
@@ -17,6 +17,8 @@
 #  7. ISBuildAction lifecycle + MP perform returning early on the client (CHECK_DELAY_MS, checked again until CHECK_WAIT_MS)
 #  8. constants copied from vanilla (50 weight floor cap, wall/door property lists, vehicle part ids)
 #  9. global ModData sync (OnReceiveGlobalModData, ModData.add/request): no vanilla Lua uses them
+# 10. (1.1.0) DoTileBuilding's press/drag/release order (rotateMouse while down, isValid/render/tryBuild on the pressed square)
+# 11. (1.1.0) pack opening through ISInventoryPaneContextMenu.OnNewCraft and recipe OpenBox100 (item 100 Nails/Screws)
 #
 # kind	target	note
 
@@ -164,3 +166,25 @@ assume	vanilla walks to furniture with walkAdjSquares: next to a tile, diagonals
 assume	stackable = first tile sprite has IsStackable; stacked on the same square, cursor/ghost raised by getTotalTableHeight, limit total + Surface <= 96; create sets RenderYOffset	BA:290-370; ISBuildIsoEntity.lua:95-97,220,336-339,672-676, ISMoveableSpriteProps.lua:1772-1774
 assume	a stack square stays valid after a level is built, so a stacked site counts as built when the objects of its name on the square went up	BA:372, runChecks
 assume	trap simulation: walls from WallN/W/collide flags and WALL_* props; doors, windows, Hoppable* passable, TallHoppable not	T:44-97; ISBuildIsoEntity.lua:616-620
+
+## 1.1.0 (2026-11-20): drag ranges, packs, search range. Line refs to 42.22.2 (= the installed game, checked by diff)
+lua-wrap	ISBuildIsoEntity:rotateMouse	BA hookCursor (dragTo); inherited from server/BuildingObjects/ISBuildingObject.lua:599 (not defined on ISBuildIsoEntity). OnGameStart. Original called unless the cursor plans sites and is a floor or wall (then the drag marks a range; walls take nSprite 2 along x, 1 along y)
+lua-wrap	ISBuildIsoEntity:isValid (again)	BA hookCursor; ISBuildIsoEntity.lua:443. On the pressed square of a drag: true when any square of the range is valid (each square checked through the 1.0 wrapper = cursorValid); else unchanged
+lua-wrap	ISBuildIsoEntity:render (again)	BA hookCursor; ISBuildIsoEntity.lua:70. During a drag the original is NOT called: the range's ghosts are drawn instead (white valid, red not, alpha 0.6 like vanilla); floor grid not drawn
+lua-wrap	ISBuildIsoEntity:tryBuild (again)	BA hookCursor; with a drag: BuildAhead.planRange (a site per valid square, one halo note) instead of onCursorClick
+lua-call	ISBuildingObject:getSprite (sets north/west from nSprite) / ISBuildIsoEntity:getFace (falls back to a side the object has)	BA dragTo; ISBuildingObject.lua:486, ISBuildIsoEntity.lua:784
+lua-call	getWorld():isValidSquare / getCell():createNewGridSquare(x, y, z, true)	BA dragValidity; same as DoTileBuilding ISBuildingObject.lua:111-113 (upper-floor squares of a range)
+lua-call	ISInventoryPaneContextMenu.OnNewCraft(item, craftRecipe, playerNum, false)	F queueOpen; client/ISUI/ISInventoryPaneContextMenu.lua:3401 (what a double-click on a pack does, ISInventoryPane.lua:1125-1133)
+lua-call	getScriptManager():getCraftRecipe(name) / FindItem(fullType)	F.packs, queueOpen; ISInventoryPane.lua:1127
+lua-field	ISBuildingObject cursor: square, isLeftDown, build, nSprite, north, spriteCache, objectInfo:getScript():getOnIsValid()	BA dragTo/renderDrag/dragKind; ISBuildingObject.lua:97-178, ISBuildIsoEntity.lua:186,832
+event	Events.OnDoTileBuilding2 (vanilla registers DoTileBuilding; the mod does not add a handler)	ISBuildingObject.lua:740
+sandbox	BuildAhead.FetchRange (integer 5-60, default 40), BuildAhead.OpenPacks (boolean, true), BuildAhead.DragBuild (boolean, true)	own options, media/sandbox-options.txt; read on OnGameStart (BuildAhead.applySandbox)
+data	recipe OpenBox100: input Base.NailsBox / Base.ScrewsBox, output item 100 Base.Nails / Base.Screws (mapper)	F.PACKS; scripts/generated/recipes/recipes_packing.txt:221-242; items' DoubleClickRecipe = OpenBox100 (items/normal.txt:3429,3468). Checked at load: a missing recipe or item leaves that pack out (log line)
+data	not used: cartons (OpenCarton12 gives 12 boxes, two recipes), drainable packs (DuctTapeBox/AdhesiveTapeBox, UnpackBox12: amounts are uses)	F.PACKS comment
+data	sprite properties for drag kinds: IsoFlagType.solidfloor = floor; IsoPropertyType WALL_N/W(_TRANS) or IsoFlagType WallN/W(NTrans/WTrans) = wall; DOOR_WALL_N/W, doorN/W, IsStackable = no drag; fallback floor: SpriteConfig OnIsValid contains ".floor." (BuildRecipeCode.floor.OnIsValid)	BA dragKind; scripts/generated/entities/walls/entity_wood_floorlvl1.txt:14
+assume	DoTileBuilding: while the build button is down, isLeftDown = true and rotateMouse(x, y) gets the square under the mouse each frame; draggingItem.square stays the pressed square; on release build = canBeBuild, then isValid(pressed square), render, and tryBuild(pressed square) if valid. A change here breaks the drag silently (a click still works)	ISBuildingObject.lua:115-178
+assume	vanilla's drag only turns the object (rotateMouse: W/E/N/S by the larger axis); for floors and walls the mod replaces this turn by a range	ISBuildingObject.lua:599-621
+assume	OnNewCraft: HandcraftLogic from the item, canPerformCurrentRecipe, moves the item from a bag first (transferIfNeeded), queues ISHandcraftAction; the outputs go to the inventory (Actions.addOrDropItem) and in MP the server performs the recipe	ISInventoryPaneContextMenu.lua:3401-3446, shared/Entity/TimedActions/ISHandcraftAction.lua:177-256
+assume	an item keeps its ID when fetched (pack opened by id after the take)	F queueOpen/checkOpen (as checkTake)
+assume	squares more than about 60 tiles from the player are not loaded (getGridSquare nil): FetchRange max 60	F.RANGE_MAX (chunk map size, unverified)
+assume	ISBuildIsoEntity floors have only face W (nSprite always 1); wall frames have W and N	scripts/generated/entities/walls/entity_wood_floorlvl1.txt, entity_woodenwallframe.txt

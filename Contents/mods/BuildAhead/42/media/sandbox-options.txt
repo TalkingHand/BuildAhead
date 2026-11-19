@@ -1,0 +1,27 @@
+VERSION = 1,
+
+option BuildAhead.FetchRange
+{
+    type = integer,
+    min = 5,
+    max = 60,
+    default = 40,
+    page = BuildAhead,
+    translation = BuildAhead_FetchRange,
+}
+
+option BuildAhead.OpenPacks
+{
+    type = boolean,
+    default = true,
+    page = BuildAhead,
+    translation = BuildAhead_OpenPacks,
+}
+
+option BuildAhead.DragBuild
+{
+    type = boolean,
+    default = true,
+    page = BuildAhead,
+    translation = BuildAhead_DragBuild,
+}
