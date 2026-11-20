@@ -18,8 +18,16 @@
 --      D3 back on the pressed square: one site, as a click
 --      D4 a crate (not a floor or wall): vanilla turns it, one site
 --      D5 a blocked square inside a floor range is left out
---      D6 a 30x30 floor drag is capped at DRAG_MAX squares
+--      D6 floor drags give the dragged rectangle up to 40x40, wall lines up to 40
 --      D7 DragBuild off: no range, vanilla turning
+--      D8 vanilla's false release over the inventory window (button held) does not plan;
+--         the drag goes on from the pressed square, the real release plans the range
+--   M  materials shared among the sites (BuildAheadFetch.allocate):
+--      M1 materials for two floors, four planned: the two nearest buildable; four planks: all;
+--         a box of nails counts as 100
+--      M2 400 floor sites planned at once (as a drag adds them): add time, frame times, every ghost
+--         checked, allocation and pick time
+--      M3 materials for three of eight frames on a grid: built nearest to the last build first
 -- Results: "[BuildAheadTest4]" lines; failures also as "[PZTest] FAIL".
 
 require "BuildAhead"
@@ -687,16 +695,117 @@ local function scenarioDragCap()
     local info = entityInfo(FLOOR)
     local p = player()
     local px, py = math.floor(p:getX()), math.floor(p:getY())
-    local c = makeCursor(info, 1)
-    c.square = sq(px, py, 0)
-    c.isLeftDown = true
-    c:rotateMouse(px + 29, py + 29)
-    local list = BuildAhead.dragSquares(c) or {}
-    check("D6 a 30x30 drag is capped", #list <= BuildAhead.DRAG_MAX and #list >= BuildAhead.DRAG_MAX - 10,
-        "squares " .. #list .. " max " .. BuildAhead.DRAG_MAX)
-    check("D6 nearest the pressed square first", list[1] and list[1].x == px and list[1].y == py)
-    c.isLeftDown = false
-    c.buildAheadDrag = nil
+    -- the range's width and height as squares, from dragSquares
+    local function shape(list)
+        local x0, x1, y0, y1 = math.huge, -math.huge, math.huge, -math.huge
+        for _, q in ipairs(list) do
+            x0, x1 = math.min(x0, q.x), math.max(x1, q.x)
+            y0, y1 = math.min(y0, q.y), math.max(y1, q.y)
+        end
+        if #list == 0 then return 0, 0 end
+        return x1 - x0 + 1, y1 - y0 + 1
+    end
+    local function floorDrag(dx, dy)
+        local c = makeCursor(info, 1)
+        c.square = sq(px, py, 0)
+        c.isLeftDown = true
+        c:rotateMouse(px + dx, py + dy)
+        local list = BuildAhead.dragSquares(c) or {}
+        c.isLeftDown = false
+        c.buildAheadDrag = nil
+        return list
+    end
+    -- each case: the drag (dx, dy) and the floor it must give (w x h, every square)
+    for _, k in ipairs({ { 29, 29, 30, 30 }, { 29, 4, 30, 5 }, { 4, 29, 5, 30 }, { -19, -9, 20, 10 },
+        { 39, 39, 40, 40 }, { 59, 59, 40, 40 }, { 59, 2, 40, 3 } }) do
+        local list = floorDrag(k[1], k[2])
+        local w, h = shape(list)
+        check("D6 floor drag " .. (math.abs(k[1]) + 1) .. "x" .. (math.abs(k[2]) + 1) .. " gives " .. k[3] .. "x" .. k[4],
+            w == k[3] and h == k[4] and #list == k[3] * k[4], "got " .. w .. "x" .. h .. " squares " .. #list)
+        if k[1] == 29 and k[2] == 29 then
+            check("D6 nearest the pressed square first", list[1] and list[1].x == px and list[1].y == py)
+        end
+    end
+    -- walls: a line of 40 at most, either axis
+    local frame = entityInfo(FRAME)
+    for _, k in ipairs({ { 29, 0, 30 }, { 59, 0, 40 }, { 0, 59, 40 } }) do
+        local c = makeCursor(frame, 1)
+        c.square = sq(px, py, 0)
+        c.isLeftDown = true
+        c:rotateMouse(px + k[1], py + k[2])
+        local n = #(BuildAhead.dragSquares(c) or {})
+        c.isLeftDown = false
+        c.buildAheadDrag = nil
+        check("D6 wall drag " .. math.max(k[1], k[2]) + 1 .. " long gives " .. k[3], n == k[3], "got " .. n)
+    end
+end
+
+-- vanilla counts the button as up over the inventory window and "releases" there
+-- (DoTileBuilding then calls tryBuild, and moves cursor.square to the mouse after);
+-- with the mouse button really held the drag goes on from the pressed square
+local function scenarioDragOverInventory()
+    clearSites()
+    local info = entityInfo(FLOOR)
+    local A = findArea(6, 5, "D8")
+    local sx, sy = A.x + 1, A.y + 1
+    local held = true
+    local orig = BuildAhead.heldOverInventory
+    BuildAhead.heldOverInventory = function() return held end
+    local ok, err = pcall(function()
+        local c = makeCursor(info, 1)
+        c.square = sq(sx, sy, 0)
+        c.isLeftDown = true
+        c:rotateMouse(sx, sy)
+        c:rotateMouse(sx + 2, sy + 1)
+        -- the false release over the inventory, as DoTileBuilding does it
+        c.isLeftDown = false
+        c.build = true
+        if c:isValid(c.square) then
+            c.build = false
+            c:tryBuild(sx, sy, 0)
+        end
+        c.build = false
+        check("D8 no sites while the button is held over the inventory", siteCount(FLOOR) == 0, "sites " .. siteCount(FLOOR))
+        check("D8 the range is kept", c.buildAheadDrag ~= nil)
+        -- next frames over the inventory: the cursor follows the mouse, render puts it back
+        c.square = sq(sx + 4, sy + 3, 0)
+        pcall(c.render, c, sx + 4, sy + 3, 0, c.square)
+        check("D8 the range is still kept after a frame", c.buildAheadDrag ~= nil)
+        -- back in the world, still held: the drag goes on from the pressed square
+        c.square = sq(sx + 4, sy + 3, 0)
+        c.isLeftDown = true
+        c:rotateMouse(sx + 3, sy + 2)
+        local d = c.buildAheadDrag
+        check("D8 the drag keeps its pressed square", d and d.sx == sx and d.sy == sy and c.square:getX() == sx,
+            d and (d.sx .. "," .. d.sy) or "no drag")
+        -- the real release
+        held = false
+        c.isLeftDown = false
+        c.build = true
+        if c:isValid(c.square) then
+            c.build = false
+            c:tryBuild(sx, sy, 0)
+        end
+        stopChain()
+        check("D8 the real release plans the whole 4x3 range", siteCount(FLOOR) == 12, "sites " .. siteCount(FLOOR))
+        -- released over the inventory: no release comes, the drag ends without sites
+        clearSites()
+        held = true
+        c = makeCursor(info, 1)
+        c.square = sq(sx, sy, 0)
+        c.isLeftDown = true
+        c:rotateMouse(sx + 2, sy)
+        c.isLeftDown = false
+        c:tryBuild(sx, sy, 0)
+        held = false
+        pcall(c.render, c, sx, sy, 0, c.square)
+        check("D8 let go over the inventory: drag ends, no sites", c.buildAheadDrag == nil and siteCount(FLOOR) == 0,
+            "sites " .. siteCount(FLOOR))
+    end)
+    BuildAhead.heldOverInventory = orig
+    if not ok then check("D8 ran", false, tostring(err)) end
+    stopChain()
+    clearSites()
 end
 
 local function scenarioDragOff()
@@ -718,6 +827,159 @@ end
 
 -- ---------------------------------------------------------------- runner
 
+-- ---------------------------------------------------------------- M shared materials
+
+-- M1: materials for two floors, four floors planned: the two nearest the player
+-- are buildable, the other two miss a plank and a nail (each site no longer counts
+-- the same planks for itself)
+local function scenarioShared()
+    local p = player()
+    clearSites()
+    clearBag()
+    local A = findArea(6, 3, "M1")
+    teleport(A.x, A.y + 1, 0)
+    wait(30)
+    onlySources({}) -- only what the player carries
+    local inv = p:getInventory()
+    inv:AddItem("Base.Hammer")
+    addTo(inv, "Base.Plank", 2)
+    addTo(inv, "Base.Nails", 2)
+    local sx, sy = A.x + 1, A.y + 1
+    for i = 0, 3 do BuildAhead.addSite(FLOOR, sx + i, sy, 0, 1) end
+    check("M1 four floor sites", siteCount(FLOOR) == 4, "sites " .. siteCount(FLOOR))
+    BuildAhead.dropAllocation()
+    local okAt, missAt = {}, {}
+    for _, site in ipairs(BuildAhead.getSites()) do
+        local ok, missing = BuildAhead.materialsAvailable(p, site)
+        if ok then okAt[#okAt + 1] = site.x - sx else missAt[#missAt + 1] = site.x - sx .. ":" .. table.concat(missing or {}, "/") end
+    end
+    table.sort(okAt)
+    log("M1 buildable", table.concat(okAt, ","), "missing", table.concat(missAt, " "))
+    check("M1 two buildable, the two nearest", #okAt == 2 and okAt[1] == 0 and okAt[2] == 1,
+        "buildable " .. table.concat(okAt, ","))
+    check("M1 the other two miss materials", #missAt == 2, table.concat(missAt, " "))
+    -- two more planks and nails: all four
+    addTo(inv, "Base.Plank", 2)
+    addTo(inv, "Base.Nails", 2)
+    BuildAhead.dropAllocation()
+    local all = 0
+    for _, site in ipairs(BuildAhead.getSites()) do
+        if BuildAhead.materialsAvailable(p, site) then all = all + 1 end
+    end
+    check("M1 with four planks all four buildable", all == 4, "buildable " .. all)
+    -- a box of nails (100) instead of loose nails covers all four
+    clearBag()
+    inv:AddItem("Base.Hammer")
+    addTo(inv, "Base.Plank", 4)
+    inv:AddItem("Base.NailsBox")
+    BuildAhead.dropAllocation()
+    all = 0
+    for _, site in ipairs(BuildAhead.getSites()) do
+        if BuildAhead.materialsAvailable(p, site) then all = all + 1 end
+    end
+    check("M1 a box of nails counts as 100 nails", all == 4, "buildable " .. all)
+    BuildAheadFetch.sourceFilter = nil
+    clearSites()
+    clearBag()
+end
+
+-- M2: 400 floor sites planned at once (no materials): frame times while their
+-- ghosts are drawn and checked, the shared allocation and the scheduler's pick
+local function scenarioManySites()
+    local p = player()
+    clearSites()
+    clearBag()
+    BuildAheadFetch.sourceFilter = nil
+    local avg0, worst0 = frameTimes(300)
+    log("M2 frame time without sites: avg", avg0, "worst", worst0)
+    local px, py = math.floor(p:getX()), math.floor(p:getY())
+    -- as a drag's release adds them: all at once
+    local entries = {}
+    for dx = -10, 9 do
+        for dy = -10, 9 do
+            if dx ~= 0 or dy ~= 0 then
+                entries[#entries + 1] = { name = FLOOR, x = px + dx, y = py + dy, z = 0, nSprite = 1 }
+            end
+        end
+    end
+    local t0 = getTimestampMs()
+    local n = #BuildAhead.addSites(entries)
+    local addMs = getTimestampMs() - t0
+    log("M2 planned", n, "sites in", addMs, "ms")
+    check("M2 adding them is quick", addMs <= 50, addMs .. " ms")
+    check("M2 about 400 sites planned", n >= 390, "sites " .. n)
+    local _, worstFirst = frameTimes(60)
+    log("M2 first frames after planning: worst", worstFirst, "ms")
+    check("M2 no freeze when they are planned", worstFirst <= math.max(150, worst0 * 3),
+        "worst " .. worstFirst .. " ms vs " .. worst0 .. " ms")
+    local avg1, worst1 = frameTimes(600)
+    log("M2 frame time with", n, "sites: avg", avg1, "worst", worst1)
+    check("M2 ghosts cost little per frame", avg1 <= avg0 + 8, "avg " .. avg1 .. " ms vs " .. avg0 .. " ms")
+    check("M2 no long frames", worst1 <= math.max(150, worst0 * 3), "worst " .. worst1 .. " ms vs " .. worst0 .. " ms")
+    local checked = 0
+    for _, site in ipairs(BuildAhead.getSites()) do
+        if BuildAhead.ghostState(site) then checked = checked + 1 end
+    end
+    check("M2 every ghost checked within 10 s", checked == n, "checked " .. checked .. " of " .. n)
+    BuildAhead.dropAllocation()
+    local t1 = getTimestampMs()
+    BuildAhead.allocation(p)
+    log("M2 shared allocation of", n, "sites took", getTimestampMs() - t1, "ms")
+    local t2 = getTimestampMs()
+    BuildAhead.pickNext(p, px, py, 0)
+    local pickMs = getTimestampMs() - t2
+    log("M2 scheduler pick among", n, "sites took", pickMs, "ms")
+    check("M2 the pick stays short", pickMs <= 100, pickMs .. " ms")
+    clearSites()
+end
+
+-- M3: materials for three wall frames, nine sites on a grid with equal distances: the
+-- chain builds nearest to the last build (list order on ties), and the shared materials
+-- follow that order (they went to the sites nearest the player before)
+local function scenarioChainOrder()
+    local p = player()
+    clearSites()
+    clearBag()
+    local A = findArea(9, 9, "M3")
+    teleport(A.x + 4, A.y + 4, 0)
+    wait(30)
+    onlySources({})
+    local px, py = math.floor(p:getX()), math.floor(p:getY())
+    for dy = -2, 2, 2 do
+        for dx = -2, 2, 2 do
+            if dx ~= 0 or dy ~= 0 then BuildAhead.addSite(FRAME, px + dx, py + dy, 0, 1) end
+        end
+    end
+    local inv = p:getInventory()
+    inv:AddItem("Base.Hammer")
+    addTo(inv, "Base.Plank", 6)
+    addTo(inv, "Base.Nails", 6)
+    local expected, used = {}, {}
+    local ox, oy = px, py
+    for _ = 1, 3 do
+        local best, bestD
+        for _, s in ipairs(BuildAhead.getSites()) do
+            local d = (s.x - ox) ^ 2 + (s.y - oy) ^ 2
+            if not used[s.id] and d <= 400 and (not bestD or d < bestD) then best, bestD = s, d end
+        end
+        used[best.id] = true
+        expected[#expected + 1] = best.x .. "," .. best.y
+        ox, oy = best.x, best.y
+    end
+    R.performed = {}
+    BuildAhead.schedule(p, px, py, 0)
+    waitIdle(60 * 120, "M3 chain")
+    local got = {}
+    for _, b in ipairs(R.performed) do got[#got + 1] = b.x .. "," .. b.y end
+    check("M3 chain builds nearest to the last build", table.concat(got, " ") == table.concat(expected, " "),
+        "built " .. table.concat(got, " ") .. " expected " .. table.concat(expected, " "))
+    check("M3 the other five stay planned", #BuildAhead.getSites() == 5, "sites " .. #BuildAhead.getSites())
+    BuildAheadFetch.sourceFilter = nil
+    stopChain()
+    clearSites()
+    clearBag()
+end
+
 local SCENARIOS = {
     { "S0 settings", scenarioSettings },
     { "P1 box in the inventory", scenarioPackCarried },
@@ -733,7 +995,11 @@ local SCENARIOS = {
     { "D4 crate", scenarioDragOther },
     { "D5 blocked square", scenarioDragBlocked },
     { "D6 cap", scenarioDragCap },
+    { "D8 over inventory", scenarioDragOverInventory },
     { "D7 drag off", scenarioDragOff },
+    { "M1 shared", scenarioShared },
+    { "M2 many sites", scenarioManySites },
+    { "M3 chain order", scenarioChainOrder },
 }
 
 local function reset()

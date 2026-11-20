@@ -55,6 +55,7 @@ BuildAhead.COLOR = { 0.35, 0.65, 1.0 }         -- buildable now
 BuildAhead.COLOR_MISSING = { 1.0, 0.85, 0.25 } -- valid, materials missing
 BuildAhead.COLOR_BLOCKED = { 1.0, 0.35, 0.3 }  -- square blocked
 BuildAhead.COLOR_TRAP = { 1.0, 0.55, 0.1 }     -- building it would wall the player in
+BuildAhead.COLOR_CHECKING = { 0.85, 0.85, 0.85 } -- planned a moment ago, not checked yet
 
 local function log(...)
     local parts = {}
@@ -107,6 +108,33 @@ function BuildAhead.addSite(name, x, y, z, nSprite, stack)
     end
     log("site added", site.id, name, x, y, z, "nSprite", nSprite, "stack", stack)
     return site
+end
+
+-- many sites at once (a drag): one pass over the list, one command, one log line.
+-- entries: { { name, x, y, z, nSprite, stack } }; returns the sites added
+function BuildAhead.addSites(entries)
+    local data = BuildAheadSites.data()
+    local added
+    if isClient() then
+        -- the local copy: as addMany, with local ids until the server's list arrives
+        local tmp = { sites = data.sites, nextId = 0 }
+        added = BuildAheadSites.addMany(tmp, entries, myName())
+        for _, site in ipairs(added) do
+            localId = localId - 1
+            site.id = localId
+        end
+        if #added > 0 then
+            local list = {}
+            for _, site in ipairs(added) do
+                list[#list + 1] = { name = site.name, x = site.x, y = site.y, z = site.z, nSprite = site.nSprite, stack = site.stack }
+            end
+            sendClientCommand(getSpecificPlayer(0), "BuildAhead", "addMany", { list = list })
+        end
+    else
+        added = BuildAheadSites.addMany(data, entries, myName())
+    end
+    log("sites added", #added, "of", #entries)
+    return added
 end
 
 function BuildAhead.removeSite(id)
@@ -313,9 +341,33 @@ local function siteEntity(playerObj, site)
     local info = objectInfoByName(site.name)
     if not info then return nil end
     local e = makeEntity(playerObj, info, site.nSprite)
-    cache[site.id] = { entity = e }
+    -- the ghost's state may be there already (drawn with the template entity)
+    if c then c.entity = e else cache[site.id] = { entity = e } end
     return e
 end
+
+-- One entity per recipe and side, for drawing ghosts and asking isValid: a site's
+-- own entity (siteEntity) fills its inputs from the containers, which many sites
+-- planned at once would all do in one frame. Materials and builds use siteEntity.
+local templates = {} -- name .. ":" .. nSprite -> entity
+local function templateEntity(playerObj, site)
+    local key = site.name .. ":" .. tostring(site.nSprite)
+    local e = templates[key]
+    if e and e.character == playerObj then return e end
+    local c = cache[site.id]
+    if c and c.entity then return c.entity end
+    local info = objectInfoByName(site.name)
+    if not info then return nil end
+    e = ISBuildIsoEntity:new(playerObj, info, site.nSprite, ArrayList.new())
+    e.player = playerObj:getPlayerNum()
+    e.dragNilAfterPlace = false
+    e.blockAfterPlace = false
+    e.buildAheadSite = true
+    e:getSprite()
+    templates[key] = e
+    return e
+end
+BuildAhead.templateEntity = templateEntity
 
 local function siteSquare(site)
     return getCell():getGridSquare(site.x, site.y, site.z)
@@ -399,7 +451,7 @@ end
 BuildAhead.stackBase = stackBase
 
 local function isSiteValid(playerObj, site)
-    local e = siteEntity(playerObj, site)
+    local e = templateEntity(playerObj, site)
     local sq = siteSquare(site)
     if not e or not sq then return false end
     local ok, valid = pcall(e.isValid, e, sq)
@@ -541,10 +593,6 @@ local function canGather(playerObj, site)
 end
 BuildAhead.canGather = canGather
 
--- at hand now, or can be fetched
-local function materialsAvailable(playerObj, site)
-    return hasMaterials(playerObj, site) or canGather(playerObj, site)
-end
 
 -- skills the recipe needs that the player lacks, as "Carpentry 2"
 local function missingSkills(playerObj, site)
@@ -561,6 +609,209 @@ local function missingSkills(playerObj, site)
     end
     return out
 end
+
+-- The materials shared out among the sites near the player in one pass
+-- (BuildAheadFetch.allocate): ten planks make ten floors buildable, not every floor
+-- planned. Kept for ALLOC_EVERY_MS while the list of sites stays the same.
+BuildAhead.ALLOC_EVERY_MS = 2000
+BuildAhead.ALLOC_DIRTY_MS = 250 -- after an item moved: how soon it is shared out again
+local alloc = nil -- { at, sig, player, bySite, dirty }
+local needsByName = {} -- recipe name -> BuildAheadFetch.recipeNeeds (one table per recipe)
+
+function BuildAhead.dropAllocation() alloc = nil end
+
+-- items moved somewhere (vanilla OnContainerUpdate): share out again soon
+local function onContainerUpdate()
+    if alloc then alloc.dirty = true end
+end
+BuildAhead.onContainerUpdate = onContainerUpdate
+
+local function needsOf(playerObj, name)
+    local n = needsByName[name]
+    if n then return n end
+    local info = objectInfoByName(name)
+    local recipe = info and info:getRecipe() and info:getRecipe():getCraftRecipe()
+    if not recipe then return nil end
+    local logic = BuildLogic.new(playerObj, nil, nil)
+    logic:setRecipe(recipe)
+    n = BuildAheadFetch.recipeNeeds(logic)
+    needsByName[name] = n
+    return n
+end
+
+-- The order the chain builds in (pickNext: the nearest to the last build, the lowest
+-- level of a stack first, list order on ties), for the first ALLOC_CHAIN_STEPS sites;
+-- the rest stay nearest the player first. list: sorted by distance to the player,
+-- this player's claimed sites first (d = -1), which stay first.
+BuildAhead.ALLOC_CHAIN_STEPS = 32
+local function chainOrder(list, x, y, z)
+    local out, rest = {}, {}
+    for _, e in ipairs(list) do
+        if e.d < 0 then
+            out[#out + 1] = e
+            x, y, z = e.site.x, e.site.y, e.site.z
+        else
+            rest[#rest + 1] = e
+        end
+    end
+    local taken = {}
+    for _ = 1, math.min(BuildAhead.ALLOC_CHAIN_STEPS, #rest) do
+        local best, bestD
+        for k, e in ipairs(rest) do
+            if not taken[k] then
+                local s = e.site
+                local d = (s.x - x) ^ 2 + (s.y - y) ^ 2 + ((s.z - z) * 3) ^ 2
+                if not best or d < bestD or (d == bestD and ((s.stack or 0) < (rest[best].site.stack or 0)
+                    or ((s.stack or 0) == (rest[best].site.stack or 0) and e.i < rest[best].i))) then
+                    best, bestD = k, d
+                end
+            end
+        end
+        taken[best] = true
+        local e = rest[best]
+        out[#out + 1] = e
+        x, y, z = e.site.x, e.site.y, e.site.z
+    end
+    for k, e in ipairs(rest) do
+        if not taken[k] then out[#out + 1] = e end
+    end
+    return out
+end
+
+-- reuse: true, a recent answer (the ghosts); "tick", one made in this tick (the
+-- scheduler's pick, after dropping the old one); "fresh", made now (single questions)
+-- the sites to share among, in the chain's order: list and excluded ids
+local function allocationInput(playerObj, sites)
+    local px, py, pz = math.floor(playerObj:getX()), math.floor(playerObj:getY()), math.floor(playerObj:getZ())
+    local far = (BuildAhead.RANGE * 2) ^ 2
+    local me = myName()
+    local list, excluded = {}, {}
+    local skillsOk = {}
+    for i, s in ipairs(sites) do
+        local d = (s.x - px) ^ 2 + (s.y - py) ^ 2
+        if d < far then
+            local n = needsOf(playerObj, s.name)
+            -- sites that will not be built take nothing: built a moment ago (awaiting the
+            -- check), blocked, or beyond the player's skills
+            local sk = skillsOk[s.name]
+            if sk == nil then
+                sk = #missingSkills(playerObj, s) == 0
+                skillsOk[s.name] = sk
+            end
+            -- blocked: as the ghost was last drawn (a fresh isValid of every site here was
+            -- most of a long frame); not drawn yet counts as buildable
+            local c = cache[s.id]
+            if n and sk and not BuildAhead.awaitingCheck(s) and not (c and c.state == "blocked") then
+                -- the site this player is building or fetching for comes first: its materials are on the way
+                list[#list + 1] = { site = s, needs = n, d = s.claimBy == me and -1 or d, i = i }
+            else
+                excluded[s.id] = true
+            end
+        end
+    end
+    table.sort(list, function(a, b)
+        if a.d ~= b.d then return a.d < b.d end
+        if (a.site.stack or 0) ~= (b.site.stack or 0) then return (a.site.stack or 0) < (b.site.stack or 0) end
+        return a.i < b.i
+    end)
+    return chainOrder(list, px, py, pz), excluded
+end
+
+local function siteSig(sites)
+    local sig = #sites
+    for _, s in ipairs(sites) do sig = sig + s.id * 31 + s.x * 7 + s.y * 13 + s.z * 3 + (s.stack or 0) end
+    return sig
+end
+
+-- For the ghosts the sharing runs as a coroutine, ALLOC_SLICE_MS per frame, and the
+-- last finished answer is used meanwhile (one pass over 400 sites was an 80 ms frame
+-- every 2 s). The scheduler's pick and single questions run it to the end at once.
+BuildAhead.ALLOC_SLICE_MS = 4
+local allocJob = nil -- { co, sig, player, at, deadline, frame }
+local renderFrame = 0
+
+local function finishAllocation(playerObj, sig, t, res, excluded, tick)
+    for id in pairs(excluded) do res[id] = { ok = false, excluded = true } end
+    alloc = { at = t, sig = sig, player = playerObj, bySite = res, tick = tick }
+    return alloc
+end
+
+-- reuse: true, a recent answer (the ghosts; worked out a slice per frame);
+-- "tick", one made in this tick (the scheduler's pick, after dropping the old one);
+-- "fresh", made now (single questions)
+local function allocation(playerObj, reuse)
+    local t = getTimestampMs()
+    local sites = BuildAhead.getSites()
+    local sig = siteSig(sites)
+    if reuse ~= "fresh" and alloc and alloc.player == playerObj and alloc.sig == sig then
+        local age = t - alloc.at
+        if reuse == "tick" then
+            if alloc.tick == BuildAheadFetch.tick then return alloc end
+        elseif age < (alloc.dirty and BuildAhead.ALLOC_DIRTY_MS or BuildAhead.ALLOC_EVERY_MS) then
+            return alloc
+        end
+    end
+    if reuse == true then
+        -- a slice of the work this frame; the last answer (or none) meanwhile
+        if not allocJob or allocJob.player ~= playerObj then
+            local list, excluded = allocationInput(playerObj, sites)
+            local job = { sig = sig, player = playerObj, at = t, deadline = 0 }
+            local bans, carried = BuildAhead.getBans(playerObj), carriedContainers(playerObj)
+            local function pause()
+                if getTimestampMs() > job.deadline then coroutine.yield() end
+            end
+            job.co = coroutine.create(function()
+                local res = BuildAheadFetch.allocate(playerObj, list, bans, carried, true, pause)
+                finishAllocation(playerObj, job.sig, job.at, res, excluded, nil)
+            end)
+            allocJob = job
+        end
+        local job = allocJob
+        if job.frame ~= renderFrame then
+            job.frame = renderFrame
+            job.deadline = getTimestampMs() + BuildAhead.ALLOC_SLICE_MS
+            local ok, err = coroutine.resume(job.co)
+            if not ok then
+                log("allocation error", err)
+                allocJob = nil
+            elseif coroutine.status(job.co) == "dead" then
+                allocJob = nil
+            end
+        end
+        return alloc or { bySite = {}, pending = true }
+    end
+    allocJob = nil
+    local list, excluded = allocationInput(playerObj, sites)
+    -- blocks: the ghosts and the scheduler's pick take those scanned in the last 2 s
+    -- (takes, drops and builds drop the blocks they change, dropBlocksAround); a single
+    -- question ("fresh") reads them in this tick, as canGather did
+    local ok, res = pcall(BuildAheadFetch.allocate, playerObj, list, BuildAhead.getBans(playerObj),
+        carriedContainers(playerObj), reuse == "fresh" and "tick" or true)
+    if not ok then
+        log("allocation error", res)
+        res = {}
+    end
+    return finishAllocation(playerObj, sig, t, res, excluded, reuse == "tick" and BuildAheadFetch.tick or nil)
+end
+BuildAhead.allocation = allocation
+
+-- at hand now, or can be fetched; sites near the player share the materials
+-- (allocation), others are asked one by one
+local function materialsAvailable(playerObj, site, reuse)
+    if playerObj:isBuildCheat() then return true end
+    -- while the ghosts are drawn a recent answer does; otherwise one from this tick (as canGather)
+    if reuse == nil then reuse = frameBudget ~= nil or "fresh" end
+    local a = allocation(playerObj, reuse)
+    local r = a.bySite[site.id]
+    if r then return r.ok, r.missing end
+    -- for the ghosts, a site near the player not in the answer yet waits for the next one
+    if reuse == true and (site.x - playerObj:getX()) ^ 2 + (site.y - playerObj:getY()) ^ 2 < (BuildAhead.RANGE * 2) ^ 2 then
+        return false
+    end
+    -- left out of the sharing (far, or not buildable now): asked on its own
+    return hasMaterials(playerObj, site) or canGather(playerObj, site)
+end
+BuildAhead.materialsAvailable = materialsAvailable
 BuildAhead.missingSkills = missingSkills
 
 -- the player has the skill levels the recipe needs (nil recipe: nothing to check)
@@ -803,8 +1054,10 @@ end
 function BuildAhead.canBuildSite(playerObj, site)
     -- skills first: a site planned by another player may need more than this player has,
     -- and the chain must not walk off to fetch materials for it
-    return not lowerLevelPlanned(site) and isSiteValid(playerObj, site) and #missingSkills(playerObj, site) == 0
-        and not BuildAhead.wouldTrap(playerObj, site) and materialsAvailable(playerObj, site)
+    -- the shared materials first: a lookup, where the trap check walks paths
+    return not lowerLevelPlanned(site) and materialsAvailable(playerObj, site, "tick")
+        and isSiteValid(playerObj, site) and #missingSkills(playerObj, site) == 0
+        and not BuildAhead.wouldTrap(playerObj, site)
 end
 
 -- "buildable", "missing" (valid, but the skill is too low, the materials are neither at hand
@@ -870,6 +1123,16 @@ local function skipKey(site)
         .. "#" .. tostring(site.stack)
 end
 local checks = {}   -- { name, x, y, z, at }: built here, see whether the object is really there
+
+-- built a moment ago, the check that removes it not done yet
+function BuildAhead.awaitingCheck(site)
+    for _, c in ipairs(checks) do
+        if c.name == site.name and c.x == site.x and c.y == site.y and c.z == site.z and c.stack == site.stack then
+            return true
+        end
+    end
+    return false
+end
 BuildAhead.CHECK_DELAY_MS = 1000 -- in multiplayer the built object arrives a little after the action ends
 BuildAhead.CHECK_WAIT_MS = 8000  -- a build not seen yet is checked again until this long after the action
 
@@ -882,18 +1145,27 @@ function BuildAhead.pickNext(playerObj, x, y, z)
     local best, bestD
     local range2 = BuildAhead.RANGE * BuildAhead.RANGE
     local me, hours = myName(), getGameTime():getWorldAgeHours()
-    for _, site in ipairs(BuildAhead.getSites()) do
+    -- the cheap filters first, then the full check nearest first: the first that
+    -- passes is the one (with many sites, checking every nearer one was a freeze)
+    local cand = {}
+    for i, site in ipairs(BuildAhead.getSites()) do
         local d = distSq(site, x, y, z)
-        -- of a planned stack, the lowest level first
-        if d <= range2 and not skipped[skipKey(site)]
-            and (not bestD or d < bestD or (d == bestD and (site.stack or 0) < (best.stack or 0)))
-            and not BuildAheadSites.isClaimedByOther(site, me, hours) then
-            if BuildAhead.canBuildSite(playerObj, site) then
-                best, bestD = site, d
-            end
+        if d <= range2 and not skipped[skipKey(site)] and not BuildAheadSites.isClaimedByOther(site, me, hours) then
+            cand[#cand + 1] = { site = site, d = d, i = i }
         end
     end
-    return best
+    -- of a planned stack, the lowest level first; equal distance: the order planned
+    table.sort(cand, function(a, b)
+        if a.d ~= b.d then return a.d < b.d end
+        if (a.site.stack or 0) ~= (b.site.stack or 0) then return (a.site.stack or 0) < (b.site.stack or 0) end
+        return a.i < b.i
+    end)
+    -- the materials shared out afresh: a build or a trip has just changed them
+    BuildAhead.dropAllocation()
+    for _, c in ipairs(cand) do
+        if BuildAhead.canBuildSite(playerObj, c.site) then return c.site end
+    end
+    return nil
 end
 
 BuildAhead.BATCH_MAX = 8 -- sites after the first whose materials a fetch trip may bring along
@@ -909,18 +1181,40 @@ function BuildAhead.expectedNext(playerObj, site)
     local range2 = BuildAhead.RANGE * BuildAhead.RANGE
     local me, hours = myName(), getGameTime():getWorldAgeHours()
     local cur = site
+    -- the full check of a site, once per call (it does not change between rounds)
+    local fine = {}
+    local function passes(s)
+        local v = fine[s.id]
+        if v == nil then
+            v = isSiteValid(playerObj, s) and #missingSkills(playerObj, s) == 0 and not BuildAhead.wouldTrap(playerObj, s)
+            fine[s.id] = v
+        end
+        return v
+    end
+    local pool = {}
+    for _, s in ipairs(BuildAhead.getSites()) do
+        if s.z == site.z and not skipped[skipKey(s)] and not BuildAheadSites.isClaimedByOther(s, me, hours) then
+            pool[#pool + 1] = s
+        end
+    end
     while #out < BuildAhead.BATCH_MAX do
-        local best, bestD
-        for _, s in ipairs(BuildAhead.getSites()) do
-            if not used[s.id] and s.z == site.z then
+        local cand = {}
+        for i, s in ipairs(pool) do
+            if not used[s.id] then
                 local d = distSq(s, cur.x, cur.y, cur.z)
-                if d <= range2 and not skipped[skipKey(s)]
-                    and (not bestD or d < bestD or (d == bestD and (s.stack or 0) < (best.stack or 0)))
-                    and not BuildAheadSites.isClaimedByOther(s, me, hours) and not lowerLevelPlanned(s, used)
-                    and isSiteValid(playerObj, s) and #missingSkills(playerObj, s) == 0
-                    and not BuildAhead.wouldTrap(playerObj, s) then
-                    best, bestD = s, d
-                end
+                if d <= range2 then cand[#cand + 1] = { s = s, d = d, i = i } end
+            end
+        end
+        table.sort(cand, function(a, b)
+            if a.d ~= b.d then return a.d < b.d end
+            if (a.s.stack or 0) ~= (b.s.stack or 0) then return (a.s.stack or 0) < (b.s.stack or 0) end
+            return a.i < b.i
+        end)
+        local best
+        for _, c in ipairs(cand) do
+            if not lowerLevelPlanned(c.s, used) and passes(c.s) then
+                best = c.s
+                break
             end
         end
         if not best then break end
@@ -1156,8 +1450,7 @@ BuildAhead.onPlannedStage = onPlannedStage
 -- pressed square along the drag (along x: north walls, along y: west walls). On
 -- release every valid square of the range becomes a planned site.
 BuildAhead.DRAG_ENABLED = true -- sandbox BuildAhead.DragBuild
-BuildAhead.DRAG_MAX = 100      -- squares one drag plans at most (a 10x10 floor)
-BuildAhead.DRAG_LINE_MAX = 40  -- squares along one side (a wall line, a floor's side)
+BuildAhead.DRAG_LINE_MAX = 40  -- squares along one side: a wall line, each side of a floor (40x40 at most)
 BuildAhead.DRAG_VALID_MS = 250 -- how long the range's validity is reused while dragging
 
 -- "floor", "wall" or false (kept on the cursor; doors and door frames are placed one by one)
@@ -1213,7 +1506,7 @@ function BuildAhead.dragSquares(cursor)
     if d.kind == "floor" then
         local sx, sy = step(d.sx, d.mx), step(d.sy, d.my)
         local w = math.min(math.abs(d.mx - d.sx) + 1, maxSide)
-        local h = math.min(math.abs(d.my - d.sy) + 1, maxSide, math.max(1, math.floor(BuildAhead.DRAG_MAX / w)))
+        local h = math.min(math.abs(d.my - d.sy) + 1, maxSide)
         for i = 0, w - 1 do
             for j = 0, h - 1 do
                 out[#out + 1] = { x = d.sx + i * sx, y = d.sy + j * sy, z = d.z, r = math.max(i, j) }
@@ -1271,6 +1564,10 @@ local function dragTo(cursor, x, y)
         clearDrag(cursor)
         return false
     end
+    -- the pressed square: kept from the drag so far (DoTileBuilding moves cursor.square
+    -- to the mouse while the button counts as up, see heldOverInventory)
+    local old = cursor.buildAheadDrag
+    if old and old.sq then cursor.square = old.sq end
     local sx, sy = cursor.square:getX(), cursor.square:getY()
     x, y = math.floor(x), math.floor(y)
     if x == sx and y == sy then
@@ -1287,10 +1584,20 @@ local function dragTo(cursor, x, y)
         end
         cursor:getSprite() -- sets cursor.north from nSprite
     end
-    cursor.buildAheadDrag = { sx = sx, sy = sy, z = cursor.square:getZ(), mx = x, my = y, kind = kind }
+    cursor.buildAheadDrag = { sx = sx, sy = sy, z = cursor.square:getZ(), mx = x, my = y, kind = kind, sq = cursor.square }
     return true
 end
 BuildAhead.dragTo = dragTo
+
+-- Vanilla counts the build button as up while the mouse is over the expanded inventory
+-- or loot window or their tooltips (CharacterInputKeyBinding.isKeyDownInWorld), and
+-- DoTileBuilding then sees a release and builds. A drag that crosses those windows
+-- would plan its range with the button still held: true while the mouse button is
+-- really down, so the drag goes on.
+local function heldOverInventory()
+    return isMouseButtonDown(0) == true
+end
+BuildAhead.heldOverInventory = heldOverInventory
 
 -- the drag's ghosts (the cursor is fixed on the pressed square meanwhile): white where
 -- the object can be placed, red where not, as vanilla's cursor
@@ -1311,18 +1618,17 @@ end
 local function planRange(cursor, list)
     local playerObj = cursor.character
     local name = cursor.objectInfo:getName()
-    local n, first, skippedSquares = 0, nil, 0
+    local skippedSquares = 0
+    local entries = {}
     for _, q in ipairs(list) do
         if q.valid and not sameAsCurrentBuild(playerObj, name, q.x, q.y, q.z) then
-            local site = BuildAhead.addSite(name, q.x, q.y, q.z, cursor.nSprite, nil)
-            if site then
-                n = n + 1
-                first = first or site
-            end
+            entries[#entries + 1] = { name = name, x = q.x, y = q.y, z = q.z, nSprite = cursor.nSprite }
         else
             skippedSquares = skippedSquares + 1
         end
     end
+    local added = BuildAhead.addSites(entries)
+    local n, first = #added, added[1]
     log("drag planned", n, "sites of", name, "from", list[1] and (list[1].x .. "," .. list[1].y) or "-",
         "squares", #list, "not valid", skippedSquares, "nSprite", cursor.nSprite)
     local reason = first and BuildAhead.cannotBuildReason(playerObj, first)
@@ -1414,10 +1720,13 @@ local function hookCursor()
     local origRender = ISBuildIsoEntity.render
     function ISBuildIsoEntity:render(x, y, z, square, ...)
         if self.buildAheadDrag then
+            local d = self.buildAheadDrag
             -- the button went up without a build (DoTileBuilding: no isLeftDown, no build)
-            if not self.isLeftDown and not self.build then
+            if not self.isLeftDown and not self.build and not BuildAhead.heldOverInventory() then
                 clearDrag(self)
             elseif plansSites(self) then
+                -- held over the inventory: DoTileBuilding moved the cursor to the mouse
+                if not self.isLeftDown and d.sq then self.square = d.sq end
                 local ok, err = pcall(renderDrag, self)
                 if ok then return end
                 logDragError("drag render error", err)
@@ -1443,6 +1752,10 @@ local function hookCursor()
                 local skills = missingSkills(self.character, { name = self.objectInfo:getName() })
                 self.character:setHaloNote(getText("IGUI_BuildAhead_NeedSkill", table.concat(skills, ", ")), 255, 100, 100, 300)
                 clearDrag(self)
+                return
+            end
+            if self.buildAheadDrag and BuildAhead.heldOverInventory() then
+                -- a release vanilla saw over the inventory, the button is still down
                 return
             end
             if self.buildAheadDrag then
@@ -1541,6 +1854,11 @@ local function hookBuildAction()
         origPerform(self, ...)
         local playerObj = self.character
         if not playerObj or not playerObj:isLocalPlayer() then return end
+        -- the materials used came from around the player: those blocks are read afresh
+        pcall(function()
+            local psq = playerObj:getCurrentSquare()
+            if psq then BuildAheadFetch.dropBlocksAround(psq:getX(), psq:getY(), psq:getZ()) end
+        end)
         if name then
             -- a site built here (by the scheduler or by hand): skip it now, and remove it
             -- once the object is there; if it stays buildable the build failed
@@ -1613,11 +1931,16 @@ end
 local function renderGhost(playerObj, site, now)
     -- a level just built stands there itself; its site goes once the check sees it
     if site.stack and stackBuilt[stackKey(site.name, site.x, site.y, site.z, site.stack)] then return end
-    local e = siteEntity(playerObj, site)
+    local e = templateEntity(playerObj, site)
     if not e then return end
     local c = cache[site.id]
-    if not c.checkedAt or (now - c.checkedAt > BuildAhead.VALIDITY_EVERY_MS and frameBudget.states > 0) then
-        if c.checkedAt then frameBudget.states = frameBudget.states - 1 end
+    if not c then
+        c = {}
+        cache[site.id] = c
+    end
+    -- new sites count against the budget too: a drag plans hundreds at once
+    if frameBudget.states > 0 and (not c.checkedAt or now - c.checkedAt > BuildAhead.VALIDITY_EVERY_MS) then
+        frameBudget.states = frameBudget.states - 1
         c.checkedAt = now
         c.state = BuildAhead.siteState(playerObj, site)
     end
@@ -1625,7 +1948,8 @@ local function renderGhost(playerObj, site, now)
     if not face then return end
     local color = c.state == "buildable" and BuildAhead.COLOR
         or c.state == "missing" and BuildAhead.COLOR_MISSING
-        or c.state == "trap" and BuildAhead.COLOR_TRAP or BuildAhead.COLOR_BLOCKED
+        or c.state == "trap" and BuildAhead.COLOR_TRAP
+        or c.state == nil and BuildAhead.COLOR_CHECKING or BuildAhead.COLOR_BLOCKED
     local a = 0.4 + 0.12 * math.sin(now / 350)
     local si = site.stack and stackInfo(e)
     local offY = si and stackBase(playerObj, site, si) * Core.getTileScale() or nil
@@ -1651,6 +1975,7 @@ function BuildAhead.ghostState(site)
 end
 
 local function onPostRender()
+    renderFrame = renderFrame + 1
     local playerObj = getSpecificPlayer(0)
     local sites = playerObj and BuildAhead.getSites()
     if not sites or #sites == 0 then return end
@@ -1900,4 +2225,5 @@ Events.OnReceiveGlobalModData.Add(onReceiveGlobalModData)
 Events.OnServerCommand.Add(onServerCommand)
 Events.OnTick.Add(onTick)
 Events.OnPostRender.Add(onPostRender)
+Events.OnContainerUpdate.Add(function() BuildAhead.onContainerUpdate() end)
 Events.OnFillWorldObjectContextMenu.Add(BuildAhead.fillContextMenu)

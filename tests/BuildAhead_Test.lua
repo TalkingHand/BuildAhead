@@ -349,7 +349,7 @@ local function buildFromMenuDone()
     BuildAhead.addSite("WoodenWallFrame", T.A.x, T.A.y, T.A.z, 1)
     -- G for the context menu test
     BuildAhead.addSite("WoodenWallFrame", T.G.x, T.G.y, T.G.z, 1)
-    -- materials for one frame: E and G turn blue, but nothing starts while idle
+    -- materials for one frame: E or G turns blue (shared, not both), nothing starts while idle
     local inv = player():getInventory()
     for _ = 1, 2 do inv:AddItem("Base.Plank"); inv:AddItem("Base.Nails") end
     T.phase = "ghost"
@@ -1211,7 +1211,9 @@ local function onTick()
                 states[k] = BuildAhead.ghostState(site)
             end
             check("4 ghost A blocked (red)", states.A == "blocked", tostring(states.A))
-            check("4 ghosts E and G buildable (blue)", states.E == "buildable" and states.G == "buildable",
+            -- materials for one frame are shared: one of E and G blue, the other yellow
+            check("4 materials for one frame: one of E and G buildable, one missing",
+                (states.E == "buildable" and states.G == "missing") or (states.E == "missing" and states.G == "buildable"),
                 tostring(states.E) .. " " .. tostring(states.G))
             check("4 materials appearing while idle start nothing", not BuildAhead.isBuilding(p)
                 and #ISTimedActionQueue.getTimedActionQueue(p).queue == 0)

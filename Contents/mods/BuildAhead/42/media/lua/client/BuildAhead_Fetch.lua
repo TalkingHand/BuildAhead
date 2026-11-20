@@ -260,6 +260,18 @@ local function blockSources(playerObj, bx, by, cz, reuse)
     return list
 end
 
+-- items changed around (x, y, z) (a take, a drop, a build): the blocks covering its
+-- 3x3 are read afresh next time
+function F.dropBlocksAround(x, y, z)
+    if not F.scanCache or not x then return end
+    local n = F.SCAN_BLOCK
+    for bx = math.floor((x - 1) / n), math.floor((x + 1) / n) do
+        for by = math.floor((y - 1) / n), math.floor((y + 1) / n) do
+            F.scanCache[bx .. "," .. by .. "," .. z] = nil
+        end
+    end
+end
+
 local function purgeScanCache()
     local t = now()
     if t - lastPurge < F.SCAN_KEEP_MS or not F.scanCache then return end
@@ -551,6 +563,206 @@ function F.plan(playerObj, logic, bans, cx, cy, cz, atHand, base, reuse)
         if picks[src] then plan[#plan + 1] = { src = src, items = picks[src] } end
     end
     return plan, nil, { taken = taken, sources = sources, logic = logic, spare = spare }
+end
+
+-- ---------------------------------------------------------------- shared allocation
+
+-- The item inputs of a recipe (logic: a BuildLogic with the recipe set), each with
+-- the amount one build uses: { input, uses, types, amount, tool, name }. The same
+-- shape as F.shortInputs' entries, so usable/packFor take them.
+function F.recipeNeeds(logic)
+    local out = {}
+    local recipe = logic and logic:getRecipe()
+    local inputs = recipe and recipe:getInputs()
+    if not inputs then return out end
+    for i = 0, inputs:size() - 1 do
+        local input = inputs:get(i)
+        if not input:isAutomationOnly() and input:getResourceType() == ResourceType.Item then
+            local uses = not input:isItemCount()
+            local types = {}
+            local possible = input:getPossibleInputItems()
+            for k = 0, possible:size() - 1 do types[possible:get(k):getFullName()] = true end
+            out[#out + 1] = { input = input, uses = uses, types = types,
+                amount = uses and input:getAmount() or input:getIntAmount(),
+                tool = input:isTool() or input:isKeep(),
+                name = possible:size() > 0 and possible:get(0):getDisplayName() or "?" }
+        end
+    end
+    return out
+end
+
+local EMPTY = {}
+
+-- The materials around shared out among many sites in one pass, instead of each
+-- site counting the same planks for itself. list: { { site, needs } } in the order
+-- the chain builds them (needs from F.recipeNeeds; the same table for every site of
+-- a recipe). The pool: what the player carries (`carried`, an ArrayList of
+-- containers) and every source within RANGE of some site, read once; each site
+-- takes its materials from it in turn (carried first, then nearest the player, only
+-- sources within RANGE of that site), and gives them back when it cannot get all of
+-- them. Tools are shared, not used up. Packs count as their loose items (as F.plan).
+-- reuse: as F.scan. pause: called between steps (a slice of the work per frame, see
+-- BuildAhead allocation); it may yield the coroutine it runs in. Returns { [site.id] = { ok = true } or { ok = false, missing = { "Plank x2" } } }.
+function F.allocate(playerObj, list, bans, carried, reuse, pause)
+    local want, packWant = {}, {}
+    local resetDone = {}
+    for _, e in ipairs(list) do
+        if not resetDone[e.needs] then
+            resetDone[e.needs] = true
+            for _, s in ipairs(e.needs) do
+                s.ok = {} -- item id -> usable for this input (this pass)
+                for t in pairs(s.types) do want[t] = true end
+            end
+        end
+    end
+    if F.OPEN_PACKS then
+        for packType, p in pairs(F.packs()) do
+            if want[p.item] then packWant[packType] = p end
+        end
+    end
+    -- pool: wanted type -> entries { item, src, d, pack, left }
+    local pool, seen = {}, {}
+    local function addTo(key, item, src, d, p)
+        local k = key .. "#" .. item:getID()
+        if seen[k] then return end
+        seen[k] = true
+        local l = pool[key]
+        if not l then
+            l = {}
+            pool[key] = l
+        end
+        l[#l + 1] = { item = item, src = src, d = d, pack = p }
+    end
+    local function add(item, src, d)
+        local t = item:getFullType()
+        if want[t] then addTo(t, item, src, d, nil) end
+        local p = packWant[t]
+        if p then addTo(p.item, item, src, d, p) end
+    end
+    for c = 0, (carried and carried:size() or 0) - 1 do
+        local cont = carried:get(c)
+        for t in pairs(want) do
+            local items = cont:getAllTypeEvalRecurse(t, ISBuildIsoEntity.predicateMaterial)
+            for n = 0, items:size() - 1 do add(items:get(n), F.CARRIED, -1) end
+        end
+        for t in pairs(packWant) do
+            local items = cont:getAllTypeEvalRecurse(t, ISBuildIsoEntity.predicateMaterial)
+            for n = 0, items:size() - 1 do add(items:get(n), F.CARRIED, -1) end
+        end
+    end
+    -- the sources: the blocks around every site (per level), each read once
+    local boxes = {}
+    for _, e in ipairs(list) do
+        local s = e.site
+        local b = boxes[s.z]
+        if not b then
+            b = { x0 = s.x, x1 = s.x, y0 = s.y, y1 = s.y }
+            boxes[s.z] = b
+        end
+        b.x0, b.x1 = math.min(b.x0, s.x), math.max(b.x1, s.x)
+        b.y0, b.y1 = math.min(b.y0, s.y), math.max(b.y1, s.y)
+    end
+    purgeScanCache()
+    local n, r = F.SCAN_BLOCK, F.RANGE + 3
+    local srcSeen = {}
+    for z, b in pairs(boxes) do
+        for bx = math.floor((b.x0 - r) / n), math.floor((b.x1 + r) / n) do
+            for by = math.floor((b.y0 - r) / n), math.floor((b.y1 + r) / n) do
+                if pause then pause() end
+                for _, src in ipairs(blockSources(playerObj, bx, by, z, reuse or true)) do
+                    if not srcSeen[src.key] and not F.isBlacklisted(src.key)
+                        and (not F.sourceFilter or F.sourceFilter(src)) then
+                        srcSeen[src.key] = true
+                        local d = distSq(playerObj, src)
+                        for _, e in ipairs(F.sourceItems(src)) do add(e.item, src, d) end
+                        if pause then pause() end
+                    end
+                end
+            end
+        end
+    end
+    for _, l in pairs(pool) do
+        table.sort(l, function(a, b)
+            if a.d ~= b.d then return a.d < b.d end
+            return (a.pack and 1 or 0) < (b.pack and 1 or 0)
+        end)
+        l.head = 1
+    end
+    local reach = {}
+    local function inRange(en, site)
+        local src = en.src
+        if src == F.CARRIED then return true end
+        if src.z ~= site.z then return false end
+        local rr = src.kind == "vehicle" and F.RANGE + 3 or F.RANGE
+        if math.abs(src.x - site.x) > rr or math.abs(src.y - site.y) > rr then return false end
+        local ok = reach[src.key]
+        if ok == nil then
+            ok = F.reachable(playerObj, src) == true
+            reach[src.key] = ok
+        end
+        return ok
+    end
+    local function fits(s, en)
+        local id = en.item:getID()
+        local v = s.ok[id]
+        if v == nil then
+            if en.pack then v = packFor(s, en.item, bans) ~= nil else v = usable(s, en.item, playerObj, bans) end
+            s.ok[id] = v
+        end
+        return v
+    end
+    local result = {}
+    for _, e in ipairs(list) do
+        if pause then pause() end
+        local site, undo, missing = e.site, {}, {}
+        for _, s in ipairs(e.needs) do
+            local short = s.amount
+            for t in pairs(s.types) do
+                if short <= 0 then break end
+                local l = pool[t] or EMPTY
+                if s.tool then
+                    -- a tool is kept: one in range is enough, and stays for the next site
+                    for i = 1, #l do
+                        local en = l[i]
+                        if not en.pack and (en.left == nil or en.left > 0) and fits(s, en) and inRange(en, site) then
+                            short = 0
+                            break
+                        end
+                    end
+                else
+                    -- entries before head are used up
+                    while l.head and l[l.head] and l[l.head].left == 0 do l.head = l.head + 1 end
+                    for i = l.head or 1, #l do
+                        if short <= 0 then break end
+                        local en = l[i]
+                        if en.left ~= 0 and fits(s, en) and inRange(en, site) then
+                            if en.left == nil then en.left = en.pack and en.pack.count or amountOf(s, en.item) end
+                            local use = math.min(en.left, short)
+                            en.left = en.left - use
+                            short = short - use
+                            undo[#undo + 1] = { en, use, l }
+                        end
+                    end
+                end
+            end
+            if short > 0 then
+                local m = math.ceil(short)
+                missing[#missing + 1] = m > 1 and (s.name .. " x" .. m) or s.name
+            end
+        end
+        if #missing > 0 then
+            -- not all found: what it took goes back for the next sites
+            for _, u in ipairs(undo) do
+                u[1].left = u[1].left + u[2]
+                u[3].head = 1
+            end
+            result[site.id] = { ok = false, missing = missing }
+        else
+            result[site.id] = { ok = true }
+        end
+    end
+    F.stats.allocations = (F.stats.allocations or 0) + 1
+    return result
 end
 
 -- the plan opens packs (it is not empty even when nothing is fetched)
@@ -911,6 +1123,7 @@ end
 
 local function checkTake(job, st)
     local got, lost = 0, 0
+    if st.src and st.src.x then F.dropBlocksAround(st.src.x, st.src.y, st.src.z) end
     -- a source where the site is built from should have counted as at hand (tests)
     local stand = job.site and standOf(BuildAhead.keptStand(job.site))
     if atHandOf(st.src, stand) then F.stats.rehandled = F.stats.rehandled + 1 end
@@ -960,6 +1173,10 @@ local function queueDrop(job)
         end
         job.carried = {}
         job.dropSquares = dropSquares(job)
+        for _, q in ipairs(job.dropSquares or {}) do
+            local ok, qx, qy, qz = pcall(function() return q:getX(), q:getY(), q:getZ() end)
+            if ok and qx then F.dropBlocksAround(qx, qy, qz) elseif q.x then F.dropBlocksAround(q.x, q.y, q.z) end
+        end
     end
     local n = 0
     queueOwn(job, function()

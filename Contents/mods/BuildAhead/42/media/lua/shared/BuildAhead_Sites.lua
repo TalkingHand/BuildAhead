@@ -17,6 +17,34 @@ end
 
 -- stack: the level of a stackable object (a crate) planned on a square that
 -- already has planned ones (nil for everything else)
+-- the key a site is told apart by (as find compares)
+function BuildAheadSites.key(name, x, y, z, nSprite, stack)
+    return name .. "@" .. x .. "," .. y .. "," .. z .. ":" .. tostring(tonumber(nSprite) or 1) .. ":" .. tostring(tonumber(stack))
+end
+
+-- many sites at once (a drag): the list is read once, not once per site.
+-- entries: { { name, x, y, z, nSprite, stack } }; returns the sites added
+function BuildAheadSites.addMany(data, entries, by)
+    local have = {}
+    for _, s in ipairs(data.sites) do have[BuildAheadSites.key(s.name, s.x, s.y, s.z, s.nSprite, s.stack)] = true end
+    local out = {}
+    for _, e in ipairs(entries) do
+        if type(e) == "table" and type(e.name) == "string" and type(e.x) == "number" and type(e.y) == "number"
+            and type(e.z) == "number" then
+            local k = BuildAheadSites.key(e.name, e.x, e.y, e.z, e.nSprite, e.stack)
+            if not have[k] then
+                have[k] = true
+                local site = { id = data.nextId, name = e.name, x = e.x, y = e.y, z = e.z,
+                    nSprite = tonumber(e.nSprite) or 1, by = by, stack = tonumber(e.stack) }
+                data.nextId = data.nextId + 1
+                table.insert(data.sites, site)
+                out[#out + 1] = site
+            end
+        end
+    end
+    return out
+end
+
 function BuildAheadSites.find(data, name, x, y, z, nSprite, stack)
     for _, s in ipairs(data.sites) do
         if s.x == x and s.y == y and s.z == z and s.name == name and s.nSprite == nSprite and s.stack == stack then

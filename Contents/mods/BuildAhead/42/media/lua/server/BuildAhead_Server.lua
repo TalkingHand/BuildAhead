@@ -1,5 +1,5 @@
 -- Multiplayer: the server owns the planned site list. Clients send
--- "add" / "remove" / "claim" / "unclaim" commands; after each change the whole list is
+-- "add" / "addMany" / "remove" / "claim" / "unclaim" commands; after each change the whole list is
 -- transmitted to every client (BuildAhead.lua replaces its copy on receive).
 -- It also keeps each player's material bans ("bans" / "getBans", in the
 -- server's copy of the player's ModData) and applies them when it performs a
@@ -27,6 +27,10 @@ local function onClientCommand(module, command, player, args)
         local site = BuildAheadSites.add(data, args.name, args.x, args.y, args.z, args.nSprite, who, args.stack)
         changed = site ~= nil
         if site then log("site added", site.id, site.name, site.x, site.y, site.z, "stack", site.stack, "by", who) end
+    elseif command == "addMany" and type(args.list) == "table" then
+        local added = BuildAheadSites.addMany(data, args.list, who)
+        changed = #added > 0
+        if changed then log("sites added", #added, "by", who) end
     elseif command == "remove" then
         changed = BuildAheadSites.remove(data, args.id)
         if changed then log("site removed", args.id, "by", who) end
