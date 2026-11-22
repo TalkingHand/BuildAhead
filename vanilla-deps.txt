@@ -1,5 +1,5 @@
 # BuildAhead: vanilla dependencies (format: _guide/README.md "9. 게임 업데이트 대응")
-# checked: 42.22.2 (pzt run 2026-11-20, parts 1-4, 332 PASS)
+# checked: 42.22.2 (pzt live 2026-11-21, parts 1-4: 122+133+20+100 PASS, 1 known FAIL M5 crate ghost delay)
 # Java methods below are also listed in tools/java-calls.json: python -I ../_tools/jcheck.py <jar> tools/java-calls.json
 # (existence only; behaviour is what the assume lines are for)
 #

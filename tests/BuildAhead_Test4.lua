@@ -28,6 +28,8 @@
 --      M2 400 floor sites planned at once (as a drag adds them): add time, frame times, every ghost
 --         checked, allocation and pick time
 --      M3 materials for three of eight frames on a grid: built nearest to the last build first
+--      M4-M6 the chain builds every site with the materials there (carried, on the ground, in a crate,
+--         every source in range), one site added midway: no ghost turns "missing" meanwhile
 -- Results: "[BuildAheadTest4]" lines; failures also as "[PZTest] FAIL".
 
 require "BuildAhead"
@@ -980,6 +982,171 @@ local function scenarioChainOrder()
     clearBag()
 end
 
+-- M4: materials for every site at hand (carried), the chain builds them one after another
+-- and a site is added in the middle: no ghost of a site still to be built may show
+-- "missing" (user 11-21: every ghost went yellow and back to blue when a site was added
+-- or built). Every non-buildable state is recorded with the allocation it came from.
+local function chainColours(label, name, fill, n)
+    local p = player()
+    clearSites()
+    clearBag()
+    local A = findArea(n + 4, 4, label)
+    teleport(A.x, A.y + 2, 0)
+    wait(30)
+    -- fill returns the squares whose sources count (none: only what the player carries)
+    -- "all": every source in range counts (as in a real game)
+    local srcs = fill(p:getInventory(), A)
+    if srcs == "all" then BuildAheadFetch.sourceFilter = nil else onlySources(srcs or {}) end
+    -- at once, as a drag adds them
+    local entries = {}
+    for i = 1, n do entries[#entries + 1] = { name = name, x = A.x + i, y = A.y + 1, z = 0, nSprite = 1 } end
+    BuildAhead.addSites(entries)
+    -- all ghosts drawn buildable first
+    local t = 0
+    while t < 600 do
+        local all = true
+        for _, s in ipairs(BuildAhead.getSites()) do
+            if BuildAhead.ghostState(s) ~= "buildable" then all = false end
+        end
+        if all then break end
+        if t % 60 == 0 and type(srcs) == "table" and srcs[1] then
+            local site = BuildAhead.getSites()[1]
+            local a, job = BuildAhead.allocationState()
+            local r = a and site and a.bySite[site.id]
+            local cs = srcs[1]
+            local nb = BuildAheadFetch.SCAN_BLOCK
+            local b = BuildAheadFetch.scanCache and BuildAheadFetch.scanCache[math.floor(cs:getX() / nb) .. ","
+                .. math.floor(cs:getY() / nb) .. ",0"]
+            local has = false
+            for _, x in ipairs(b and b.list or {}) do
+                if x.x == cs:getX() and x.y == cs:getY() then has = true end
+            end
+            log(label, "wait", t, "ghost", tostring(BuildAhead.ghostState(site)), "alloc", a and ("age "
+                .. (getTimestampMs() - a.at) .. " entry " .. (r and (tostring(r.ok) .. (r.excluded and " excluded" or "")
+                .. " " .. table.concat(r.missing or {}, "/")) or "none")) or "nil", "job", tostring(job ~= nil),
+                "block", b and ("age " .. (getTimestampMs() - b.at) .. " has " .. tostring(has)) or "none",
+                "filter", tostring(BuildAheadFetch.sourceFilter ~= nil))
+        end
+        if t == 599 then
+            local blocked = 0
+            for _, s in ipairs(BuildAhead.getSites()) do
+                if BuildAhead.ghostState(s) == "blocked" then blocked = blocked + 1 end
+            end
+            if blocked > 0 then log(label, blocked, "sites blocked (an earlier scenario built there)"); break end
+        end
+        t = t + 1
+        coroutine.yield()
+    end
+    if not check(label .. " all " .. n .. " ghosts buildable before the chain", t < 600, "frames " .. t) then
+        local a, job = BuildAhead.allocationState()
+        for _, s in ipairs(BuildAhead.getSites()) do
+            local r = a and a.bySite[s.id]
+            local okM, miss = BuildAhead.materialsAvailable(p, s, "fresh")
+            log(label, "site", s.id, s.x, s.y, "ghost", tostring(BuildAhead.ghostState(s)), "state now",
+                tostring(BuildAhead.siteState(p, s)), "alloc entry",
+                r and (tostring(r.ok) .. " " .. table.concat(r.missing or {}, "/")) or "none",
+                "alloc age", a and (getTimestampMs() - a.at) or "nil", "job", tostring(job ~= nil),
+                "fresh", tostring(okM), table.concat(miss or {}, "/"))
+        end
+    end
+    local flips, seen = {}, 0
+    local orig = BuildAhead.siteState
+    BuildAhead.siteState = function(pl, site)
+        local st = orig(pl, site)
+        if st == "missing" and not BuildAhead.awaitingCheck(site) then
+            seen = seen + 1
+            if #flips < 12 then
+                local a, job = BuildAhead.allocationState()
+                local r = a and a.bySite[site.id]
+                local acts = {}
+                for _, q in ipairs(queue(pl)) do acts[#acts + 1] = tostring(q.Type) end
+                flips[#flips + 1] = "site " .. site.id .. " " .. tostring(st) .. " alloc "
+                    .. (a and ("age " .. (getTimestampMs() - a.at) .. " tick " .. tostring(a.tick)
+                        .. " entry " .. (r and (tostring(r.ok) .. (r.excluded and " excluded" or "")
+                            .. " " .. table.concat(r.missing or {}, "/")) or "none")) or "nil")
+                    .. " job " .. tostring(job ~= nil) .. " queue " .. table.concat(acts, ",")
+            end
+        end
+        return st
+    end
+    R.performed = {}
+    startChain()
+    local added = false
+    t = 0
+    while t < 60 * 180 do
+        t = t + 1
+        coroutine.yield()
+        if not added and #R.performed >= 2 then
+            added = true
+            BuildAhead.addSite(name, A.x + n + 1, A.y + 1, 0, 1)
+            log(label, "site added during the chain")
+        end
+        if added and not busy(p) and t % 60 == 0 then
+            local open = 0
+            for _, s in ipairs(BuildAhead.getSites()) do
+                if BuildAhead.ghostState(s) ~= "blocked" then open = open + 1 end
+            end
+            if open == 0 then break end
+        end
+    end
+    BuildAhead.siteState = orig
+    for _, f in ipairs(flips) do log(label, "not buildable:", f) end
+    local left = 0
+    for _, s in ipairs(BuildAhead.getSites()) do
+        if BuildAhead.ghostState(s) ~= "blocked" then left = left + 1 end
+    end
+    check(label .. " every site built", left == 0,
+        "built " .. #R.performed .. " left " .. #BuildAhead.getSites() .. " " .. diag())
+    check(label .. " no ghost turned missing while the materials were there", seen == 0, "states " .. seen)
+    BuildAheadFetch.sourceFilter = nil
+    stopChain()
+    clearSites()
+    clearBag()
+end
+
+local function scenarioChainColours()
+    chainColours("M4 gravel", "GravelFloor", function(inv)
+        addTo(inv, "Base.Gravelbag", 3) -- 4 uses each, 9 floors
+    end, 8)
+    local inv = player():getInventory()
+    local items = inv:getItems()
+    for i = items:size() - 1, 0, -1 do
+        local ty = items:get(i):getFullType()
+        if ty == "Base.Gravelbag" or ty == "Base.EmptySandbag" then inv:DoRemoveItem(items:get(i)) end
+    end
+    chainColours("M4 wood", FLOOR, function(inv)
+        inv:AddItem("Base.Hammer")
+        addTo(inv, "Base.Plank", 9)
+        addTo(inv, "Base.Nails", 9)
+    end, 8)
+end
+
+local function dropGravel()
+    local inv = player():getInventory()
+    local items = inv:getItems()
+    for i = items:size() - 1, 0, -1 do
+        local ty = items:get(i):getFullType()
+        if ty == "Base.Gravelbag" or ty == "Base.EmptySandbag" then inv:DoRemoveItem(items:get(i)) end
+    end
+end
+
+-- M5: as M4, the gravel not carried: M5 floor on the ground beside the row, M5 crate in a crate two squares off
+local function scenarioChainColoursWorld()
+    chainColours("M5 floor", "GravelFloor", function(_, A)
+        local s = sq(A.x, A.y + 3, 0)
+        for _ = 1, 3 do s:AddWorldInventoryItem("Base.Gravelbag", 0.5, 0.5, 0) end
+        return { s }
+    end, 8)
+    dropGravel()
+    chainColours("M5 crate", "GravelFloor", function(_, A)
+        local s = sq(A.x + 4, A.y + 3, 0)
+        local _, c = newCrate(s)
+        addTo(c, "Base.Gravelbag", 3)
+        return { s }
+    end, 8)
+    dropGravel()
+end
+
 local SCENARIOS = {
     { "S0 settings", scenarioSettings },
     { "P1 box in the inventory", scenarioPackCarried },
@@ -1000,6 +1167,65 @@ local SCENARIOS = {
     { "M1 shared", scenarioShared },
     { "M2 many sites", scenarioManySites },
     { "M3 chain order", scenarioChainOrder },
+    { "M4 chain colours", scenarioChainColours },
+    { "M5 chain colours, gravel in the world", scenarioChainColoursWorld },
+    -- diagnostic only (not in a full run's expectations): a crate placed next to planned
+    -- sites, what the ghosts' allocation sees of its block every second
+    { "M7 probe crate block", function()
+        local p = player()
+        clearSites()
+        clearBag()
+        local p0 = player()
+        teleport(math.floor(p0:getX()) - 30, math.floor(p0:getY()) + 30, 0)
+        wait(60)
+        local A = findArea(12, 4, "M7")
+        teleport(A.x, A.y + 2, 0)
+        wait(30)
+        local s = sq(A.x + 4, A.y + 3, 0)
+        local _, c = newCrate(s)
+        addTo(c, "Base.Gravelbag", 3)
+        onlySources({ s })
+        local entries = {}
+        for i = 1, 8 do entries[#entries + 1] = { name = "GravelFloor", x = A.x + i, y = A.y + 1, z = 0, nSprite = 1 } end
+        BuildAhead.addSites(entries)
+        local n = BuildAheadFetch.SCAN_BLOCK
+        local key = math.floor(s:getX() / n) .. "," .. math.floor(s:getY() / n) .. ",0"
+        for sec = 1, 8 do
+            wait(60)
+            local site = BuildAhead.getSites()[1]
+            local a = BuildAhead.allocationState()
+            local r = a and a.bySite[site.id]
+            local b = BuildAheadFetch.scanCache and BuildAheadFetch.scanCache[key]
+            local src
+            for _, x in ipairs(b and b.list or {}) do
+                if x.x == s:getX() and x.y == s:getY() then src = x end
+            end
+            local items = src and BuildAheadFetch.sourceItems(src) or {}
+            log("M7", sec, "s ghost", tostring(BuildAhead.ghostState(site)), "ghost alloc", r and (tostring(r.ok) .. " "
+                .. table.concat(r.missing or {}, "/") .. (r.excluded and " excluded" or "")) or "none",
+                "crate src", src and ("kind " .. tostring(src.kind) .. " items " .. #items .. " reachable "
+                .. tostring(BuildAheadFetch.reachable(p, src)) .. " blacklisted " .. tostring(BuildAheadFetch.isBlacklisted(src.key))) or "none")
+        end
+        local rs = BuildAhead.allocation(p, false).bySite[BuildAhead.getSites()[1].id]
+        log("M7 sync with reused blocks:", rs and (tostring(rs.ok) .. " " .. table.concat(rs.missing or {}, "/")) or "none")
+        local rf = BuildAhead.allocation(p, "fresh").bySite[BuildAhead.getSites()[1].id]
+        log("M7 fresh:", rf and (tostring(rf.ok) .. " " .. table.concat(rf.missing or {}, "/")) or "none")
+        BuildAheadFetch.sourceFilter = nil
+        clearSites()
+        clearBag()
+    end },
+    { "M6 chain colours, every source in range", function()
+        -- away from the rows earlier runs built (a reload forgets the areas used)
+        local p0 = player()
+        teleport(math.floor(p0:getX()), math.floor(p0:getY()) + 14, 0)
+        wait(60)
+        chainColours("M6 all sources", "GravelFloor", function(_, A)
+            local s = sq(A.x, A.y + 3, 0)
+            for _ = 1, 4 do s:AddWorldInventoryItem("Base.Gravelbag", 0.5, 0.5, 0) end
+            return "all"
+        end, 12)
+        dropGravel()
+    end },
 }
 
 local function reset()
@@ -1034,7 +1260,7 @@ local function startScenario(i)
         return
     end
     log("scenario", s[1])
-    R.co = coroutine.create(s[2])
+    R.co = coroutine.create(s[2] or function() PZTest.fail("scenario " .. tostring(s[1]) .. ": function is nil (defined below the scenario list?)") end)
 end
 
 Events.OnRenderTick.Add(function()

@@ -206,8 +206,21 @@ end
 
 local function onReceiveGlobalModData(key, data)
     if key ~= BuildAheadSites.KEY or type(data) ~= "table" then return end
+    -- the server's list replaces ours after every add, remove and claim: the ghosts of
+    -- sites still planned keep their state (found by square, a local id becomes the
+    -- server's), the rest are dropped. Clearing it all made every ghost check again at
+    -- once on each change (user report 11-21, on a server).
+    local old = {}
+    for _, s in ipairs(BuildAhead.getSites()) do
+        local c = cache[s.id]
+        if c then old[BuildAheadSites.key(s.name, s.x, s.y, s.z, s.nSprite, s.stack)] = c end
+    end
     ModData.add(BuildAheadSites.KEY, data)
     for id in pairs(cache) do cache[id] = nil end
+    for _, s in ipairs(type(data.sites) == "table" and data.sites or {}) do
+        local c = old[BuildAheadSites.key(s.name, s.x, s.y, s.z, s.nSprite, s.stack)]
+        if c then cache[s.id] = c end
+    end
 end
 
 -- ---------------------------------------------------------------- material bans
@@ -615,6 +628,7 @@ end
 -- planned. Kept for ALLOC_EVERY_MS while the list of sites stays the same.
 BuildAhead.ALLOC_EVERY_MS = 2000
 BuildAhead.ALLOC_DIRTY_MS = 250 -- after an item moved: how soon it is shared out again
+BuildAhead.MISSING_CONFIRM_MS = 1000 -- a buildable ghost turns yellow once "missing" holds this long
 local alloc = nil -- { at, sig, player, bySite, dirty }
 local needsByName = {} -- recipe name -> BuildAheadFetch.recipeNeeds (one table per recipe)
 
@@ -729,6 +743,8 @@ end
 BuildAhead.ALLOC_SLICE_MS = 4
 local allocJob = nil -- { co, sig, player, at, deadline, frame }
 local renderFrame = 0
+-- tests: the last finished answer and the job working out the next one
+function BuildAhead.allocationState() return alloc, allocJob end
 
 local function finishAllocation(playerObj, sig, t, res, excluded, tick)
     for id in pairs(excluded) do res[id] = { ok = false, excluded = true } end
@@ -804,9 +820,12 @@ local function materialsAvailable(playerObj, site, reuse)
     local a = allocation(playerObj, reuse)
     local r = a.bySite[site.id]
     if r then return r.ok, r.missing end
-    -- for the ghosts, a site near the player not in the answer yet waits for the next one
+    -- for the ghosts, a site near the player not in the answer yet waits for the next one,
+    -- keeping what it was drawn with (in multiplayer the server's list gives a new site its
+    -- id after the answer was made)
     if reuse == true and (site.x - playerObj:getX()) ^ 2 + (site.y - playerObj:getY()) ^ 2 < (BuildAhead.RANGE * 2) ^ 2 then
-        return false
+        local c = cache[site.id]
+        return c ~= nil and c.state == "buildable"
     end
     -- left out of the sharing (far, or not buildable now): asked on its own
     return hasMaterials(playerObj, site) or canGather(playerObj, site)
@@ -1942,7 +1961,21 @@ local function renderGhost(playerObj, site, now)
     if frameBudget.states > 0 and (not c.checkedAt or now - c.checkedAt > BuildAhead.VALIDITY_EVERY_MS) then
         frameBudget.states = frameBudget.states - 1
         c.checkedAt = now
-        c.state = BuildAhead.siteState(playerObj, site)
+        local st = BuildAhead.siteState(playerObj, site)
+        -- buildable -> missing only once it stays so for MISSING_CONFIRM_MS: one shared
+        -- answer covers every site, and in multiplayer the inventory is in flux for a
+        -- moment after a build (the server's update), so a single wrong answer turned
+        -- every ghost yellow and back (user report 11-21, on a server)
+        if st == "missing" and c.state == "buildable" then
+            c.missingSince = c.missingSince or now
+            if now - c.missingSince < BuildAhead.MISSING_CONFIRM_MS then
+                st = "buildable"
+                if alloc then alloc.dirty = true end -- ask again soon
+            end
+        else
+            c.missingSince = nil
+        end
+        c.state = st
     end
     local face = e:getFace()
     if not face then return end
